@@ -1,24 +1,34 @@
 # Техническое задание: SignFinder MVP
 ## Система автоматического поиска мест подписи в договорах
 
-**Версия:** 0.5
-**Дата:** май 2025
-**Статус:** Согласовано к реализации
+**Версия:** 1.0
+**Дата:** май 2026
+**Статус:** Реализовано и задеплоено
+**Репозиторий:** https://github.com/alexgeorg2507-creator/SignPDFMVP
+**Продакшн URL:** https://signfinder-67920127004.europe-west1.run.app
 
 ---
 
 ## 1. Цель и контекст
 
-Система позволяет оператору загрузить договор (PDF или DOCX), автоматически найти места для подписи для заданной стороны и наложить PNG-подпись. Результат — PDF с подписями, готовый к скачиванию.
+Система позволяет оператору загрузить договор (PDF или DOCX), автоматически найти места для подписи для заданной стороны договора, наложить PNG-подпись и скачать готовый PDF.
 
-Языки договоров: **RU, EN, PL**
-Юрисдикции: РФ / ЕАЭС / EU (Польша)
+**Языки договоров:** RU, EN, PL
+**Юрисдикции:** РФ / ЕАЭС / EU (Польша)
+**Модель:** Claude Sonnet 4.6 (LLM-валидация мест подписи)
 
 ---
 
 ## 2. Конфигурационные файлы
 
+Хранятся в GCS bucket `gs://signfinder-config/`. В режиме разработки — локально в `config/`.
+Редактируются через UI приложения с автоматическим бэкапом.
+
 ### 2.1 `parties.md` — реестр сторон
+
+Формат секций `## СТОРОНА: <name>` с полями `aliases`, `sign_patterns`, `notes`.
+
+**Важно:** паттерны содержат одиночный `\s` (не `\\s`) — файл хранится в GCS, bash heredoc не применяется.
 
 ```markdown
 # Реестр сторон договора
@@ -29,9 +39,9 @@ aliases:
   - Customer
   - Zamawiający
 sign_patterns:
-  - "Заказчик[\\s_]*_{3,}"
-  - "_{3,}[\\s]*\\(Лебедев"
-  - "Customer[\\s_]*_{3,}"
+  - "Заказчик[\s_]*_{3,}"
+  - "_{3,}\s*\(Лебедев"
+  - "Customer[\s_]*_{3,}"
 notes: "Физлицо или ИП. Подпись + расшифровка ФИО в скобках."
 
 ---
@@ -42,9 +52,10 @@ aliases:
   - Client
   - Klient
 sign_patterns:
-  - "Клиент[\\s_]*_{3,}"
-  - "Client[\\s_]*_{3,}"
-notes: "Подпись в таблице реквизитов и под таблицей (2 места)."
+  - "Клиент[\s_]*_{3,}"
+  - "_{3,}\s*Нечепуренко"
+  - "Client[\s_]*_{3,}"
+notes: "Подпись в таблице реквизитов и под таблицей."
 
 ---
 
@@ -54,43 +65,40 @@ aliases:
   - Tenant
   - Najemca
 sign_patterns:
-  - "Арендатор[:\\s]*_{3,}"
+  - "Арендатор[:\s]*_{3,}"
   - "Подпись_{3,}"
-  - "Tenant[\\s_]*_{3,}"
+  - "Tenant[\s_]*_{3,}"
 notes: "Шаблонный договор — искать по роли, не по ФИО."
 ```
 
-### 2.2 `corrections.md` — база корректировок ошибок
+### 2.2 `corrections.md` — база корректировок
+
+COR-001 (декоративный колонтитул) удалён — подписи в подвале каждой страницы являются реальными местами визирования.
 
 ```markdown
 # База корректировок SignFinder
-
-## COR-001: Декоративный колонтитул-подпись
-**Проблема:** Строка "Заказчик____" повторяется в колонтитуле каждой страницы.
-**Признак:** паттерн совпадает на 4+ страницах подряд в одной позиции Y
-**Действие:** flag=decorative — не предлагать оператору
-**Пример:** Договор_Лебдев_А_П_.pdf, стр. 1–4
-
----
 
 ## COR-002: Дубли строки подписи — намеренные
 **Проблема:** "Клиент ______" дважды подряд — два экземпляра договора.
 **Признак:** идентичный паттерн на расстоянии < 3 строк
 **Действие:** count=2, предложить обе позиции отдельно
+**Статус:** ⏳ запланировано в v2
 
 ---
 
 ## COR-003: Подпись внутри ячейки таблицы
-**Проблема:** pdfplumber возвращает bbox всей ячейки.
-**Признак:** in_table=true, высота bbox > 40px
+**Проблема:** fitz возвращает bbox всей ячейки, не строки подписи.
+**Признак:** высота bbox > 40pt
 **Действие:** сузить bbox до нижней трети ячейки
+**Статус:** ⏳ запланировано в v2
 
 ---
 
 ## COR-004: Место уже подписано
-**Проблема:** В bbox уже есть изображение.
+**Проблема:** В bbox уже есть изображение (ранее подписанный документ).
 **Признак:** image-объект в bbox или отсутствие символов "_"
 **Действие:** status=already_signed, предупредить оператора
+**Статус:** ⏳ запланировано в v2
 ```
 
 ---
@@ -102,33 +110,36 @@ notes: "Шаблонный договор — искать по роли, не �
 │  🔐  КОД ДОСТУПА  [____________]  [Войти]              │
 │      (блокирует весь UI до ввода верного кода)         │
 ├────────────────────────────────────────────────────────┤
-│  ⚙️  НАСТРОЙКИ  (expander, свёрнут по умолчанию)       │
+│  1️⃣  ПОДПИСЬ (обязательно)                              │
+│  [Загрузить PNG]  [превью 200px]  ✅ Подпись загружена │
+├────────────────────────────────────────────────────────┤
+│  2️⃣  ДОКУМЕНТ (доступно только при загруженной подписи)│
+│  [Загрузить PDF / DOCX]   Сторона: [dropdown ▼]        │
+│  ☑ LLM-валидация                                       │
+│  [🔍 Найти места подписи]                              │
+├────────────────────────────────────────────────────────┤
+│  ✅  РЕЗУЛЬТАТ ПОИСКА                                   │
+│  Реальные места: N  |  Отклонены: M                    │
+│  ☑ sig_001 · стр.1 · conf 0.95 · "Клиент ______..."   │
+│  ☑ sig_002 · стр.2 · conf 0.95 · ...                  │
+│                                                        │
+│  [Предпросмотр страниц — красные рамки = bbox]         │
+│                                                        │
+│  ☐ Защитить от редактирования (flatten PDF)           │
+│  [▶ Применить подпись]                                 │
+│                                                        │
+│  📥 Подписанный документ                               │
+│  [⬇ Скачать PDF]                                       │
+│  [Превью подписанных страниц]                          │
+├────────────────────────────────────────────────────────┤
+│  ⚙️  НАСТРОЙКИ (expander, внизу страницы)              │
 │  ┌──────────────────┬───────────────────────────────┐  │
 │  │ parties.md       │ corrections.md                │  │
 │  │ [textarea]       │ [textarea]                    │  │
 │  │ [💾 Сохранить]   │ [💾 Сохранить]                │  │
 │  └──────────────────┴───────────────────────────────┘  │
-│  Подпись: [Загрузить PNG]  [превью 80x40px]            │
-├────────────────────────────────────────────────────────┤
-│  📄  ДОКУМЕНТ                                          │
-│  [Загрузить PDF / DOCX]                                │
-│  Язык: 🇷🇺 RU (autodetect)   Сторона: [dropdown ▼]    │
-│  [🔍 Найти места подписи]                              │
-├────────────────────────────────────────────────────────┤
-│  ✅  РЕЗУЛЬТАТ                                         │
-│  Найдено: 3 места                                      │
-│  ☑ стр.3 | "Заказчик____" | conf: 0.95                │
-│  ☑ стр.5 | "(Лебедев А.П.)" | conf: 0.91              │
-│  ☐ стр.1 | decorative (COR-001) — авто-исключено      │
 │                                                        │
-│  ☐ Защитить от редактирования (flatten PDF)           │
-│  [▶ Применить подпись]                                 │
-│                                                        │
-│  [Предпросмотр — страницы с подписями]                 │
-│  [⬇ Скачать PDF]                                       │
-│                                                        │
-│  ─────────────────────────────────────────────────     │
-│  📋 [Техническое задание SignFinder MVP v0.5] (link)   │
+│  📋 [Техническое задание SignFinder MVP v1.0]          │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -138,61 +149,77 @@ notes: "Шаблонный договор — искать по роли, не �
 
 ### 4.1 Аутентификация
 
-| ID | Требование |
-|----|-----------|
-| F-00 | Поле ввода промокода на странице до открытия UI |
-| F-01 | Промокод сравнивается с env var `ACCESS_CODE` |
-| F-02 | При совпадении: `session_state["auth"] = True`, UI разблокируется |
-| F-03 | При несовпадении: сообщение об ошибке, UI остаётся закрытым |
+| ID | Требование | Статус |
+|----|-----------|--------|
+| F-00 | Поле ввода промокода до открытия UI | ✅ |
+| F-01 | Промокод сравнивается с env var `ACCESS_CODE` | ✅ |
+| F-02 | При совпадении: `session_state["auth"] = True` | ✅ |
+| F-03 | При несовпадении: сообщение об ошибке | ✅ |
 
-### 4.2 Настройки
+### 4.2 Подпись (Шаг 1)
 
-| ID | Требование |
-|----|-----------|
-| F-10 | Просмотр и редактирование `parties.md` в UI (textarea) |
-| F-11 | Просмотр и редактирование `corrections.md` в UI |
-| F-12 | Сохранение в GCS с бэкапом (`parties_20250510_143200.md`) |
-| F-13 | Загрузка PNG подписи (RGBA), превью в UI |
-| F-14 | PNG хранится в `session_state`; при перезагрузке — загрузить повторно |
+| ID | Требование | Статус |
+|----|-----------|--------|
+| F-10 | Загрузка PNG подписи (RGBA, прозрачный фон) на главной странице | ✅ |
+| F-11 | Превью PNG в UI | ✅ |
+| F-12 | PNG хранится в `session_state`; при перезагрузке — загрузить повторно | ✅ |
+| F-13 | Шаг 2 (документ) недоступен пока не загружена подпись | ✅ |
 
-### 4.3 Обработка документа
+### 4.3 Настройки
 
-| ID | Требование |
-|----|-----------|
-| F-20 | Загрузка PDF или DOCX, до 50 МБ |
-| F-21 | Автодетект языка (langdetect) |
-| F-22 | Выбор стороны из `parties.md` (dropdown по заголовкам `## СТОРОНА:`) |
-| F-23 | Поиск по regex-паттернам выбранной стороны |
-| F-24 | Валидация через Claude API `claude-sonnet-4-6` |
-| F-25 | Применение корректировок из `corrections.md` |
-| F-26 | Список мест: страница, контекст, confidence, статус корректировки |
+| ID | Требование | Статус |
+|----|-----------|--------|
+| F-20 | Просмотр и редактирование `parties.md` в UI (textarea) | ✅ |
+| F-21 | Просмотр и редактирование `corrections.md` в UI | ✅ |
+| F-22 | Сохранение в GCS с бэкапом (`parties_YYYYMMDD_HHMMSS.md`) | ✅ |
 
-### 4.4 Предпросмотр и наложение
+### 4.4 Обработка документа (Шаг 2)
 
-| ID | Требование |
-|----|-----------|
-| F-30 | Предпросмотр страниц с подсветкой bbox (красный прямоугольник) |
-| F-31 | Чекбокс исключения каждого места оператором |
-| F-32 | PNG накладывается as-is без масштабирования, левый край bbox |
-| F-33 | Опция flatten PDF перед применением |
-| F-34 | Предпросмотр результата inline |
-| F-35 | Скачивание итогового PDF |
-| F-36 | Документ не сохраняется на сервере |
+| ID | Требование | Статус |
+|----|-----------|--------|
+| F-30 | Загрузка PDF или DOCX, до 50 МБ | ✅ |
+| F-31 | Автодетект языка (langdetect) | ✅ |
+| F-32 | Выбор стороны из `parties.md` (dropdown) | ✅ |
+| F-33 | Поиск по regex-паттернам выбранной стороны | ✅ |
+| F-34 | LLM-валидация через Claude API `claude-sonnet-4-6` (опционально) | ✅ |
+| F-35 | Применение корректировок из `corrections.md` | ⏳ заглушка, v2 |
+| F-36 | Список мест: страница, контекст, confidence | ✅ |
+
+### 4.5 Предпросмотр и наложение
+
+| ID | Требование | Статус |
+|----|-----------|--------|
+| F-40 | Предпросмотр страниц с красным bbox найденных мест | ✅ |
+| F-41 | Чекбокс исключения каждого места оператором | ✅ |
+| F-42 | PNG накладывается с фиксированной высотой 30pt, пропорционально | ✅ |
+| F-43 | Якорь подписи — начало подчёркиваний на странице (через `search_for`) | ✅ |
+| F-44 | Опция flatten PDF | ✅ |
+| F-45 | Предпросмотр результата (подписанные страницы) | ✅ |
+| F-46 | Скачивание итогового PDF | ✅ |
+| F-47 | Документ не сохраняется на сервере | ✅ |
 
 ---
 
 ## 5. Нефункциональные требования
 
 ### 5.1 Деплой
-- **GCP Cloud Run** — контейнер Docker, serverless, привязка к текущему Google Account
-- Конфиги `parties.md` / `corrections.md` — **GCP Cloud Storage** bucket
-- Env vars в Cloud Run: `ACCESS_CODE`, `ANTHROPIC_API_KEY`, `GCS_BUCKET`
-- Смена промокода: обновить env var в Cloud Run Console → restart (редеплой не нужен)
+- **GCP Cloud Run** — `signfinder`, region `europe-west1`, serverless
+- **GCP Cloud Storage** — `gs://signfinder-config/` для конфигов
+- **Artifact Registry** — Docker образы в `cloud-run-source-deploy`
+- **Env vars в Cloud Run:** `ACCESS_CODE`, `ANTHROPIC_API_KEY`, `GCS_BUCKET`
+- **Деплой:** `gcloud run deploy signfinder --source . --region europe-west1 ...`
+- **CI/CD:** `cloudbuild.yaml` создан, Cloud Build trigger ⏳ не настроен
 
 ### 5.2 Производительность
 - Обработка до 10 страниц: < 30 сек
-- Cloud Run: `min-instances=0` (cold start ~5 сек), `max-instances=1`
-- Memory: 2GB (LibreOffice + pymupdf)
+- Cold start: ~10-15 сек (LibreOffice в образе)
+- Cloud Run: `min-instances=0`, `max-instances=1`
+- Memory: 2GB, CPU: 1
+
+### 5.3 Стоимость (ориентировочно)
+- Idle: < $1/мес (только Artifact Registry storage)
+- Активное использование (2-3 ч/день): ~$5-15/мес GCP
+- Anthropic API: ~$0.01-0.02 за документ
 
 ---
 
@@ -207,12 +234,13 @@ notes: "Шаблонный договор — искать по роли, не �
 │  ┌──────────┐    ┌─────────────────────────────┐   │
 │  │ app.py   │───▶│         core/               │   │
 │  │Streamlit │    │  auth.py      → env var      │   │
-│  │  UI      │    │  storage.py   → GCS          │   │
-│  │          │    │  parser.py    → fitz/docx    │   │
+│  │  UI      │    │  storage.py   → GCS / local  │   │
+│  │          │    │  parser.py    → fitz / LO    │   │
 │  │          │    │  finder.py    → regex        │   │
 │  │          │    │  validator.py → Claude API   │   │
-│  │          │    │  corrector.py → corrections  │   │
+│  │          │    │  corrector.py → pass-through │   │
 │  │          │    │  overlay.py   → fitz PNG     │   │
+│  │          │    │  preview.py   → fitz render  │   │
 │  └──────────┘    └─────────────────────────────┘   │
 │                                                     │
 └──────────────┬──────────────┬───────────────────────┘
@@ -220,233 +248,128 @@ notes: "Шаблонный договор — искать по роли, не �
     ┌──────────▼──┐    ┌──────▼──────────┐
     │ GCS bucket  │    │  Anthropic API  │
     │ parties.md  │    │  claude-sonnet  │
-    │corrections  │    └─────────────────┘
-    └─────────────┘
+    │corrections  │    │  4-6            │
+    └─────────────┘    └─────────────────┘
 ```
 
 ### 6.2 Структура проекта
 
 ```
-signfinder/
-├── app.py                   # Streamlit entry point, UI логика
-├── Dockerfile               # python:3.11-slim + LibreOffice + deps
+SignPDFMVP/
+├── app.py                   # Streamlit entry point
+├── Dockerfile               # python:3.11-slim + libreoffice + deps
+├── cloudbuild.yaml          # Cloud Build CI/CD конфиг
 ├── requirements.txt
-├── .env.example             # ACCESS_CODE, ANTHROPIC_API_KEY, GCS_BUCKET
-├── config/                  # локально для разработки
+├── .env.example
+├── .gcloudignore
+├── SignPDFMVP               # Текущий файл ТЗ (этот документ)
+├── config/                  # Локально для разработки
 │   ├── parties.md
 │   └── corrections.md
 └── core/
-    ├── auth.py              # check_access_code(input) → bool
-    ├── storage.py           # read/write MD: local (dev) / GCS (prod)
-    ├── parser.py            # load_document() → pages[{text, bbox, images}]
-    ├── finder.py            # find_signatures(pages, party) → [SignMatch]
-    ├── validator.py         # validate_with_llm([SignMatch]) → [SignMatch+confidence]
-    ├── corrector.py         # apply_corrections([SignMatch], corrections) → [SignMatch]
-    └── overlay.py           # apply_signature(pdf_bytes, matches, png, flatten) → pdf_bytes
+    ├── auth.py              # Проверка промокода из env
+    ├── storage.py           # GCS (prod) / local (dev) switch
+    ├── parser.py            # PDF/DOCX → ParsedDocument (fitz + LibreOffice)
+    ├── finder.py            # regex поиск + parse_parties_md()
+    ├── validator.py         # Claude API batch validation
+    ├── corrector.py         # pass-through заглушка (v2: COR-002/003/004)
+    ├── overlay.py           # PNG наложение + flatten
+    └── preview.py           # Рендер страниц PDF с bbox подсветкой
 ```
 
-### 6.3 Ключевые модули
+### 6.3 Ключевые реализационные решения
 
-**`parser.py`**
-```
-load_document(file_bytes, mime_type)
-  PDF  → fitz.open() → [{page, text, words+bbox, images}]
-  DOCX → convert to PDF via LibreOffice → fitz.open()
-```
+**Парсинг:**
+- PDF: `pymupdf (fitz)` → text + word bbox per page
+- DOCX: `LibreOffice headless --convert-to pdf` → затем fitz
+- LibreOffice baked in Docker image (не зависит от системы)
 
-**`finder.py`**
-```
-find_signatures(pages, party_config)
-  1. parse party_config → aliases, patterns
-  2. for each page: regex search over text
-  3. map match position → bbox via word coordinates
-  4. return [SignMatch(page, bbox, context, raw_pattern)]
-```
+**Поиск мест подписи:**
+- regex по паттернам из `parties.md`
+- `page.search_for("___")` для точного bbox подчёркиваний
+- Fallback: 30% offset от левого края bbox (после слова роли)
 
-**`validator.py`**
-```
-validate_with_llm(matches, document_text)
-  prompt → Claude Sonnet:
-    "Это место для подписи стороны {party}? Контекст: {context}"
-  returns confidence 0..1, filtered list
-```
+**LLM-валидация:**
+- Batch prompt в Claude Sonnet 4.6
+- Graceful degradation: `confidence=0.5` если API недоступен
+- Опциональна (чекбокс в UI)
 
-**`corrector.py`**
-```
-apply_corrections(matches, corrections_md)
-  parse corrections_md → [Correction(id, trigger, action)]
-  for each match: check triggers → apply action
-    decorative   → exclude
-    in_table     → adjust bbox
-    already_signed → flag warning
-```
-
-**`overlay.py`**
-```
-apply_signature(pdf_bytes, matches, png_bytes, flatten=False)
-  doc = fitz.open(pdf_bytes)
-  for match in matches:
-    page = doc[match.page]
-    rect = fitz.Rect(match.bbox)
-    page.insert_image(rect, stream=png_bytes, keep_proportion=True)
-  if flatten: doc.save(..., deflate=True, clean=True)
-  return doc.tobytes()
-```
+**Наложение подписи:**
+- Высота PNG: `max(30pt, line_height × 3)`
+- Якорь: нижний край подчёркиваний (`page.search_for("___")`)
+- PNG прозрачный фон (RGBA), цвет чернил — черный
 
 ---
 
-## 7. Этапы реализации
-
-### Этап 0 — Инфраструктура GCP (2–3 часа)
+## 7. Зависимости
 
 ```
-□ Создать GCS bucket: gs://signfinder-config/
-□ Загрузить начальные parties.md и corrections.md в bucket
-□ Создать service account с правами:
-    roles/storage.objectAdmin (bucket)
-□ Настроить Cloud Run env vars:
-    ACCESS_CODE=<промокод>
-    ANTHROPIC_API_KEY=<ключ>
-    GCS_BUCKET=signfinder-config
-□ Написать Dockerfile (base: python:3.11-slim)
-    + apt: libreoffice-writer, fonts-liberation
-    + pip: -r requirements.txt
-□ Тест: docker build + docker run локально
-```
-
-### Этап 1 — Аутентификация (1–2 часа)
-
-```
-□ app.py: если не authenticated → показать только форму кода
-□ core/auth.py: compare(input, os.environ["ACCESS_CODE"])
-□ session_state["auth"] = True при успехе
-□ Тест: верный код → UI, неверный → ошибка
-```
-
-### Этап 2 — Storage и конфиги (2–3 часа)
-
-```
-□ core/storage.py:
-    read_md(filename) → str
-      dev: open("config/{filename}")
-      prod: gcs_client.bucket.blob(filename).download_as_text()
-    write_md(filename, content) → None
-      + backup: filename_YYYYMMDD_HHMMSS.md
-□ app.py: панель настроек — textarea + кнопка сохранить
-□ parse_parties(md_text) → [{name, aliases, patterns, notes}]
-□ parse_corrections(md_text) → [{id, trigger, action, notes}]
-□ Тест: редактировать parties.md в UI → сохранить → перечитать
-```
-
-### Этап 3 — Парсинг документа (3–4 часа)
-
-```
-□ core/parser.py:
-    PDF: fitz.open(stream=bytes) → extract words+bbox per page
-    DOCX: subprocess LibreOffice --headless --convert-to pdf
-          → result PDF → fitz
-□ app.py: загрузка файла, детект языка (langdetect)
-□ Тест: загрузить Договор_Лебдев_А_П_.pdf
-         → получить список слов с координатами
-```
-
-### Этап 4 — Поиск мест подписи (3–4 часа)
-
-```
-□ core/finder.py: regex по паттернам из parties.md
-□ Маппинг позиции в тексте → bbox через word-координаты fitz
-□ app.py: dropdown сторон → кнопка поиска → список результатов
-□ Тест на 4 загруженных договорах:
-    Договор_Лебдев_А_П_.pdf     → Заказчик → 7 мест (стр.1-5,6,7)
-    Договор_аренды.pdf          → Арендатор → 2 места (стр.4, стр.5)
-    BSS_ДОГОВОР.pdf             → Заказчик → 1 место (стр.3)
-    ТАМОЖЕННЫЙ_ПРЕДСТАВИТЕЛЬ.docx → Клиент → 3 места
-```
-
-### Этап 5 — LLM валидация и корректировки (3–4 часа)
-
-```
-□ core/validator.py: батчевый промпт в Claude API
-    input: список мест с контекстом
-    output: confidence + is_signature (bool)
-□ core/corrector.py: применить corrections.md
-    COR-001: исключить декоративные колонтитулы
-    COR-002: разделить дубли
-    COR-003: скорректировать bbox таблиц
-    COR-004: пометить уже подписанные
-□ Тест: COR-001 должен убрать стр.1-4 из Договора ЦИС
-```
-
-### Этап 6 — Предпросмотр и наложение подписи (4–5 часов)
-
-```
-□ Предпросмотр: рендер страниц PDF как изображений (fitz → PNG)
-    нарисовать красный bbox на найденных местах
-□ Чекбоксы исключения для каждого места
-□ Загрузка PNG подписи → session_state
-□ core/overlay.py: insert_image в bbox, as-is
-□ Опция flatten: fitz save с флагом
-□ Предпросмотр результата: рендер страниц после наложения
-□ Кнопка скачать → st.download_button(pdf_bytes)
-□ Тест end-to-end: договор → поиск → подпись → скачать PDF
-```
-
-### Этап 7 — Деплой на Cloud Run (2–3 часа)
-
-```
-□ gcloud builds submit --tag gcr.io/{project}/signfinder
-□ gcloud run deploy signfinder \
-    --image gcr.io/{project}/signfinder \
-    --platform managed \
-    --region europe-west1 \
-    --memory 2Gi \
-    --set-env-vars ACCESS_CODE=xxx,ANTHROPIC_API_KEY=xxx,GCS_BUCKET=xxx \
-    --min-instances 0 \
-    --max-instances 1 \
-    --allow-unauthenticated
-□ Тест: открыть URL → ввести промокод → прогнать тестовый договор
-```
-
----
-
-## 8. Зависимости (requirements.txt)
-
-```
-streamlit==1.35.0
-pymupdf==1.24.0
-python-docx==1.1.0
+streamlit>=1.35.0
+pymupdf>=1.24.0
+python-docx>=1.1.0
 langdetect==1.0.9
-anthropic==0.28.0
-google-cloud-storage==2.17.0
-Pillow==10.3.0
+anthropic>=0.40.0
+google-cloud-storage>=2.17.0
+Pillow>=10.3.0
+numpy>=1.26.0
 ```
+
+**Системные (в Docker образе):**
+- `libreoffice` — DOCX → PDF конвертация
 
 ---
 
-## 9. Внутренний формат результата (SignMatch)
+## 8. Внутренний формат (SignMatch)
 
 ```python
 @dataclass
 class SignMatch:
-    id: str               # "sig_001"
-    page: int             # 0-indexed
-    bbox: list            # [x0, y0, x1, y1] в pt
-    context: str          # текст вокруг места подписи
-    raw_pattern: str      # какой regex сработал
-    confidence: float     # 0..1 от LLM
-    status: str           # confirmed / decorative / already_signed
-    correction_applied: str | None  # "COR-001" или None
-    operator_excluded: bool         # оператор снял чекбокс
+    id: str                       # "sig_001"
+    page: int                     # 0-indexed
+    bbox: tuple                   # (x0, y0, x1, y1) в pt
+    context: str                  # текст вокруг места подписи
+    party: str                    # имя стороны
+    pattern: str                  # какой regex сработал
+    confidence: float = 0.0       # 0..1 от LLM (0.5 = не проверялось)
+    status: str = "candidate"     # candidate / confirmed / rejected_by_llm / decorative
+    correction_applied: str|None = None
+    operator_excluded: bool = False
 ```
 
 ---
 
-## 10. Ограничения MVP (out of scope)
+## 9. Известные ограничения (out of scope MVP v1)
 
-- Несколько PNG-подписей за одну операцию
-- Масштабирование подписи
-- Ручное добавление мест кликом по странице
-- Хранение документов на сервере
+| Ограничение | Планируется в |
+|-------------|--------------|
+| COR-002/003/004 (corrector.py — заглушка) | v2 |
+| CI/CD auto-deploy trigger | v1.1 |
+| Несколько PNG-подписей за операцию | v2 |
+| Ручное добавление мест кликом по странице | v2 |
+| Масштабирование подписи оператором | v2 |
+| Аудит-лог | v3 |
+| Многопользовательский режим / ролевая модель | v3 |
+| Определение стороны по ФИО + компания (без parties.md) | v2 |
+| Авто-извлечение сторон из шапки договора | v3 |
+| Мультиподписант | v2 |
+
+---
+
+## 10. Дорожная карта
+
+### v1.1 (ближайшее)
+- CI/CD trigger: Cloud Build автодеплой на push в main
+- Обновление ссылки на ТЗ в UI (на blob URL в GitHub)
+
+### v2 (следующая итерация)
+- UX: ввод ФИО + компания вместо dropdown parties.md
+- COR-002/003/004 в corrector.py
+- Мультиподписант (две роли в одном документе)
+- Новые языки: DE, FR (паттерны в parties.md)
+- LLM-first поиск (без обязательных regex паттернов)
+
+### v3 (продуктовый)
+- Авто-детект всех сторон из шапки договора
 - Аудит-лог
 - Многопользовательский режим
-- Ролевая модель доступа
+- Workflow (цепочка согласований)
