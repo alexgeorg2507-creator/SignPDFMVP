@@ -1,0 +1,236 @@
+{
+  "version": "2.0.1",
+  "parties": {
+    "Заказчик": {
+      "display": "Заказчик | Customer | Zamawiający",
+      "languages": {
+        "ru": {
+          "aliases": ["Заказчик", "Покупатель"],
+          "patterns": [
+            "Заказчик[\\s_]*_{3,}",
+            "_{3,}\\s*\\(Лебедев"
+          ]
+        },
+        "en": {
+          "aliases": ["Customer", "Buyer"],
+          "patterns": [
+            "Customer[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Zamawiający"],
+          "patterns": [
+            "ZAMAWIAJĄCY[\\s\\n]*_{3,}",
+            "Zamawiający[\\s_:]*_{3,}",
+            "_{3,}[\\s\\n]*\\(Zamawiający"
+          ]
+        }
+      },
+      "notes": "Покупатель/заказчик услуг. Физлицо или ИП."
+    },
+    "Клиент": {
+      "display": "Клиент | Client | Klient",
+      "languages": {
+        "ru": {
+          "aliases": ["Клиент"],
+          "patterns": [
+            "Клиент[\\s_]*_{3,}",
+            "_{3,}\\s*Нечепуренко"
+          ]
+        },
+        "en": {
+          "aliases": ["Client"],
+          "patterns": [
+            "Client[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Klient"],
+          "patterns": [
+            "Klient[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "Подпись в таблице реквизитов и под таблицей."
+    },
+    "Арендатор": {
+      "display": "Арендатор | Tenant | Najemca",
+      "languages": {
+        "ru": {
+          "aliases": ["Арендатор"],
+          "patterns": [
+            "Арендатор[:\\s]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Tenant"],
+          "patterns": [
+            "Tenant[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Najemca"],
+          "patterns": [
+            "Najemca[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "Шаблонный договор аренды. Привязка строго к слову 'Арендатор' слева от подчёркиваний."
+    },
+    "Исполнитель": {
+      "display": "Исполнитель | Contractor | Wykonawca",
+      "languages": {
+        "ru": {
+          "aliases": ["Исполнитель", "Поставщик"],
+          "patterns": [
+            "Исполнитель[\\s_:]*_{3,}",
+            "Поставщик[\\s_:]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Contractor", "Supplier", "Vendor"],
+          "patterns": [
+            "Contractor[\\s_]*_{3,}",
+            "Supplier[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Wykonawca"],
+          "patterns": [
+            "\\*\\*WYKONAWCA\\*\\*",
+            "WYKONAWCA[\\s\\n]*_{3,}",
+            "Wykonawca[\\s_:]*_{3,}",
+            "_{3,}[\\s\\n]*\\(Wykonawca"
+          ]
+        }
+      },
+      "notes": "Сторона-исполнитель / подрядчик."
+    },
+    "Арендодатель": {
+      "display": "Арендодатель | Landlord | Wynajmujący",
+      "languages": {
+        "ru": {
+          "aliases": ["Арендодатель"],
+          "patterns": [
+            "Арендодатель[:\\s]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Landlord", "Lessor"],
+          "patterns": [
+            "Landlord[\\s_]*_{3,}",
+            "Lessor[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Wynajmujący"],
+          "patterns": [
+            "Wynajmujący[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "Сторона-арендодатель."
+    },
+    "Доверитель": {
+      "display": "Доверитель | Principal | Dający Zlecenie",
+      "languages": {
+        "ru": {
+          "aliases": ["Доверитель"],
+          "patterns": [
+            "Доверитель[\\s_:]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Principal"],
+          "patterns": [
+            "Principal[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Dający Zlecenie"],
+          "patterns": [
+            "Dający Zlecenie[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "Договор поручения — сторона-доверитель."
+    },
+    "Поверенный": {
+      "display": "Поверенный | Agent | Przyjmujący Zlecenie",
+      "languages": {
+        "ru": {
+          "aliases": ["Поверенный"],
+          "patterns": [
+            "Поверенный[\\s_:]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Agent", "Attorney"],
+          "patterns": [
+            "Agent[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Przyjmujący Zlecenie"],
+          "patterns": [
+            "Przyjmujący Zlecenie[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "Договор поручения — сторона-поверенный."
+    },
+    "Администратор данных": {
+      "display": "Администратор данных | Data Controller | Administrator",
+      "languages": {
+        "ru": {
+          "aliases": ["Администратор данных", "Контролёр"],
+          "patterns": [
+            "Администратор[\\s_:]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Data Controller", "Controller"],
+          "patterns": [
+            "Controller[\\s_]*_{3,}",
+            "Data Controller[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Administrator"],
+          "patterns": [
+            "ADMINISTRATOR[\\s\\n]*_{3,}",
+            "Administrator[\\s_:]*_{3,}"
+          ]
+        }
+      },
+      "notes": "GDPR / обработка персональных данных."
+    },
+    "Процессор данных": {
+      "display": "Процессор данных | Data Processor | Podmiot przetwarzający",
+      "languages": {
+        "ru": {
+          "aliases": ["Процессор", "Обработчик"],
+          "patterns": [
+            "Процессор[\\s_:]*_{3,}",
+            "Обработчик[\\s_:]*_{3,}"
+          ]
+        },
+        "en": {
+          "aliases": ["Data Processor", "Processor"],
+          "patterns": [
+            "Processor[\\s_]*_{3,}",
+            "Data Processor[\\s_]*_{3,}"
+          ]
+        },
+        "pl": {
+          "aliases": ["Podmiot przetwarzający"],
+          "patterns": [
+            "Podmiot przetwarzający[\\s_:]*_{3,}",
+            "PODMIOT PRZETWARZAJĄCY[\\s\\n]*_{3,}"
+          ]
+        }
+      },
+      "notes": "GDPR — процессор персональных данных."
+    }
+  }
+}
