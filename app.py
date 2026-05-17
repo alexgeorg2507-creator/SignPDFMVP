@@ -1,7 +1,6 @@
-"""SignFinder MVP 1.4.0 — JSON экспорт результатов"""
+"""SignFinder MVP 1.4.2 — LLM-fallback для документов без паттернов"""
 import json
 import time
-from datetime import datetime
 
 import streamlit as st
 
@@ -11,7 +10,7 @@ from core.storage import (
     read_signature, write_signature, delete_signature,
 )
 from core.parser import parse_document
-from core.finder import parse_parties_json, parse_parties_md, find_signatures
+from core.finder import parse_parties_json, parse_parties_md, find_signatures, find_signatures_smart
 from core.corrector import apply_corrections
 from core.validator import validate_with_llm
 from core.preview import render_page_with_highlights
@@ -47,139 +46,86 @@ if "signature_autoloaded" not in st.session_state:
             st.session_state["signature_png"] = saved
 
 
-def _run_search(doc, parties_list, selected_party, use_llm, mode="По роли"):
+def _run_search(doc, parties_list, selected_party, use_llm, use_llm_fallback=False):
     party_obj = next((p for p in parties_list if p["name"] == selected_party), None)
     if not party_obj:
         st.error("Сторона не найдена в конфиге")
         return
-    
-    start_time = time.time()
     with st.spinner(f"Поиск для стороны '{selected_party}'..."):
         try:
-            matches = find_signatures(doc, party_obj)
+            t0 = time.time()
+            
+            # v1.4.2: умный поиск с LLM-fallback
+            if use_llm_fallback:
+                matches, source = find_signatures_smart(doc, party_obj, min_expected=1, llm_fallback=True)
+                st.session_state["search_source"] = source
+            else:
+                matches = find_signatures(doc, party_obj)
+                st.session_state["search_source"] = "regex"
+            
             matches = apply_corrections(matches)
             if use_llm:
                 with st.spinner("LLM-валидация через Claude..."):
                     matches = validate_with_llm(matches, selected_party)
+            elapsed = round(time.time() - t0, 1)
             st.session_state["matches"] = matches
+            st.session_state["search_elapsed"] = elapsed
+            st.session_state["search_config"] = {
+                "mode": "По роли",
+                "party": selected_party,
+                "use_llm_validation": use_llm,
+                "use_llm_fallback": use_llm_fallback,
+            }
             st.session_state.pop("signed_pdf", None)
         except Exception as e:
             st.error(f"Ошибка поиска: {e}")
-            return
-    
-    elapsed = time.time() - start_time
-    st.session_state["last_search_time"] = elapsed
-    st.session_state["search_config"] = {
-        "mode": mode,
-        "party": selected_party,
-        "use_llm_validation": use_llm,
-        "use_llm_fallback": False  # пока нет в v1.4.0
-    }
 
 
-def _handle_resolved_party(doc, parties_list, result, use_llm):
+def _handle_resolved_party(doc, parties_list, result, use_llm, use_llm_fallback):
     if result.get("error") or not result.get("party"):
         return
     if result["confidence"] < 0.5:
         return
-    _run_search(doc, parties_list, result["party"], use_llm, mode="По подписанту")
-
-
-def _export_results_json() -> str:
-    """Формирует JSON-экспорт результатов поиска."""
-    doc = st.session_state["parsed_doc"]
-    all_matches = st.session_state["matches"]
-    config = st.session_state.get("search_config", {})
-    elapsed = st.session_state.get("last_search_time", 0)
-    
-    confirmed = [m for m in all_matches if m.status not in ("rejected_by_llm", "decorative")]
-    rejected = [m for m in all_matches if m.status in ("rejected_by_llm", "decorative")]
-    
-    export = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "doc_info": {
-            "filename": doc.filename,
-            "pages": len(doc.pages),
-            "language": doc.language,
-            "size_bytes": len(doc.pdf_bytes)
-        },
-        "search_config": config,
-        "results": {
-            "total_found": len(all_matches),
-            "after_validation": len(confirmed),
-            "rejected_by_llm": len(rejected),
-            "processing_time_seconds": round(elapsed, 1)
-        },
-        "matches": [
-            {
-                "id": m.id,
-                "page": m.page,
-                "bbox": list(m.bbox),
-                "pattern": m.pattern,
-                "context": m.context,
-                "confidence": m.confidence,
-                "status": m.status,
-                "operator_excluded": m.operator_excluded
-            }
-            for m in confirmed
-        ],
-        "rejected": [
-            {
-                "id": m.id,
-                "page": m.page,
-                "reason": m.status,
-                "pattern": m.pattern,
-                "context": m.context
-            }
-            for m in rejected
-        ]
-    }
-    return json.dumps(export, ensure_ascii=False, indent=2)
+    _run_search(doc, parties_list, result["party"], use_llm, use_llm_fallback)
 
 st.title("📝 SignFinder MVP")
 st.caption("Поиск мест подписи в договорах PDF / DOCX")
 
-
-# ── ШАГ 1: ПОДПИСЬ ───────────────────────────────────────────────────────────
-st.subheader("1️⃣ Подпись")
-
-sig_col1, sig_col2 = st.columns([2, 1])
-with sig_col1:
-    sig_upload = st.file_uploader(
-        "Загрузить PNG подписи (прозрачный фон, обязательно)",
-        type=["png"],
-        key="sig_uploader",
-    )
-    if sig_upload is not None:
-        png_bytes = sig_upload.getvalue()
-        st.session_state["signature_png"] = png_bytes
-        # Сохраняем в GCS/локально для следующих сессий
-        try:
-            write_signature(png_bytes)
-        except Exception:
-            pass  # не блокируем основной флоу
-
-with sig_col2:
-    if "signature_png" in st.session_state:
-        st.image(st.session_state["signature_png"], width=200)
-        st.success("✅ Подпись загружена")
-        if st.button("🗑 Забыть подпись", help="Удалить сохранённую подпись из хранилища"):
-            st.session_state.pop("signature_png", None)
-            try:
-                delete_signature()
-            except Exception:
-                pass
+# ── ДИАГНОСТИКА (sidebar) ─────────────────────────────────────────────────────
+with st.sidebar:
+    with st.expander("🔧 Debug: session_state", expanded=False):
+        diag_keys = ["last_uploaded_name", "resolved_party", "search_triggered_for",
+                     "search_source", "search_elapsed", "similar_templates"]
+        for k in diag_keys:
+            v = st.session_state.get(k, "—")
+            st.caption(f"`{k}`: {v}")
+        if st.button("🗑 Очистить session", key="debug_clear"):
+            for k in list(st.session_state.keys()):
+                if k not in ("auth", "signature_png", "signature_autoloaded"):
+                    st.session_state.pop(k)
             st.rerun()
-    else:
-        st.warning("⬅ Загрузите PNG подписи")
 
 
+# ── ПОДПИСЬ ──────────────────────────────────────────────────────────────────
 sig_ready = "signature_png" in st.session_state
 
+if not sig_ready:
+    col1, col2 = st.columns([3, 1], vertical_alignment="center")
+    with col1:
+        st.warning("⚠️ Подпись не загружена.")
+    with col2:
+        st.page_link("pages/4_⚙️_Настройки.py", label="Загрузить", icon="⚙️")
+else:
+    col1, col2 = st.columns([3, 1], vertical_alignment="center")
+    with col1:
+        st.success("✅ Подпись загружена")
+    with col2:
+        st.page_link("pages/4_⚙️_Настройки.py", label="Изменить", icon="⚙️")
 
-# ── ШАГ 2: ДОКУМЕНТ ──────────────────────────────────────────────────────────
+
+# ── ШАГ 1: ДОКУМЕНТ ──────────────────────────────────────────────────────────
 st.divider()
-st.subheader("2️⃣ Документ")
+st.subheader("1️⃣ Документ")
 
 if not sig_ready:
     st.info("Сначала загрузите подпись (шаг 1).")
@@ -213,6 +159,15 @@ else:
                     st.session_state.pop("matches", None)
                     st.session_state.pop("signed_pdf", None)
                     st.session_state.pop("resolved_party", None)
+                    
+                    # v1.4.3: Поиск похожих шаблонов
+                    from core.template_matcher import compute_fingerprint, find_similar_templates
+                    try:
+                        fingerprint = compute_fingerprint(parsed)
+                        similar = find_similar_templates(fingerprint, parsed.language, threshold=0.85)
+                        st.session_state["similar_templates"] = similar
+                    except Exception:
+                        st.session_state["similar_templates"] = []
                     st.rerun()
                 except Exception as e:
                     st.error(f"Ошибка парсинга: {e}")
@@ -224,6 +179,30 @@ else:
         c1.metric("Файл", doc.filename)
         c2.metric("Страниц", len(doc.pages))
         c3.metric("Язык", doc.language.upper())
+
+        # v1.4.3: Баннер похожего шаблона
+        similar = st.session_state.get("similar_templates", [])
+        if similar:
+            template, similarity = similar[0]
+            st.info(
+                f"📋 Найден похожий шаблон: **{template.get('name')}** "
+                f"(совпадение {similarity*100:.0f}%). "
+                f"Применить сохранённые места подписи?"
+            )
+            col_apply, col_skip = st.columns([1, 3])
+            with col_apply:
+                if st.button("✅ Применить шаблон", key="apply_template_btn"):
+                    from core.template_applier import apply_template_simple
+                    matches = apply_template_simple(doc, template)
+                    st.session_state["matches"] = matches
+                    st.session_state["search_source"] = "template"
+                    st.session_state.pop("similar_templates", None)
+                    st.rerun()
+            with col_skip:
+                if st.button("⏭ Пропустить", key="skip_template_btn"):
+                    st.session_state.pop("similar_templates", None)
+                    st.rerun()
+            st.divider()
 
         with st.expander("👁 Превью первой страницы", expanded=False):
             try:
@@ -238,110 +217,174 @@ else:
             options=["По роли", "По подписанту"],
             horizontal=True,
             key="search_mode",
-            label_visibility="collapsed",
         )
 
-        doc_lang = st.session_state.get("parsed_doc_language")
-        parties_list = _load_parties(doc_lang)
-        use_llm = st.checkbox("LLM-валидация мест подписи", value=True)
+        parties_list = _load_parties(doc.language)
 
-        def _party_label(name: str) -> str:
-            for p in parties_list:
-                if p["name"] == name:
-                    return p.get("display") or name
-            return name
-
+        # ───────────────────────────────────────────────────────────────────────
+        # Режим: По роли
+        # ───────────────────────────────────────────────────────────────────────
         if mode == "По роли":
-            party_names = [p["name"] for p in parties_list]
-            if party_names:
-                selected_party = st.selectbox(
-                    "Сторона",
-                    options=party_names,
-                    format_func=_party_label,
-                    key="party_selector",
+            if not parties_list:
+                st.error("parties.json пуст или не загрузился.")
+                st.stop()
+
+            col_party, col_llm, col_fallback = st.columns([2, 1, 1])
+            with col_party:
+                selected = st.selectbox(
+                    "Сторона договора",
+                    options=[p["name"] for p in parties_list],
+                    key="role_party_select",
                 )
-            else:
-                st.warning("Конфиг сторон пуст")
-                selected_party = None
+            with col_llm:
+                use_llm = st.checkbox(
+                    "LLM-валидация",
+                    value=True,
+                    key="role_use_llm",
+                    help="Отсеивает ложные срабатывания через Claude",
+                )
+            with col_fallback:
+                use_llm_fallback = st.checkbox(
+                    "🤖 LLM-fallback",
+                    value=False,
+                    key="role_llm_fallback",
+                    help="Если regex нашёл <N мест → LLM ищет напрямую",
+                )
 
             if st.button("🔍 Найти места подписи", type="primary"):
-                _run_search(doc, parties_list, selected_party, use_llm)
+                _run_search(doc, parties_list, selected, use_llm, use_llm_fallback)
 
+        # ───────────────────────────────────────────────────────────────────────
+        # Режим: По подписанту
+        # ───────────────────────────────────────────────────────────────────────
         else:
-            col_a, col_b = st.columns(2)
-            with col_a:
+            st.markdown("**Кто подписывает?**")
+            col_name, col_company = st.columns(2)
+            with col_name:
                 signer_name = st.text_input(
                     "ФИО подписанта *",
-                    placeholder="напр. Лебедев Александр Петрович",
-                    key="signer_name_input",
+                    placeholder="напр. Иван Петров",
+                    key="signer_name",
                 )
-            with col_b:
-                company = st.text_input(
-                    "Компания (опционально)",
+            with col_company:
+                signer_company = st.text_input(
+                    "Компания (необязательно)",
                     placeholder="напр. ООО Ромашка",
-                    key="company_input",
+                    key="signer_company",
                 )
 
-            if st.button("🎯 Определить сторону и найти", type="primary"):
-                if not signer_name.strip():
-                    st.error("Укажите ФИО подписанта")
-                else:
-                    if doc_lang not in ("ru", "en", "pl"):
-                        with st.spinner("Определяю язык документа..."):
-                            lang = detect_language(doc)
-                            st.session_state["parsed_doc_language"] = lang
-                            parties_list = _load_parties(lang)
+            col_llm2, col_fallback2 = st.columns([1, 1])
+            with col_llm2:
+                use_llm2 = st.checkbox(
+                    "LLM-валидация",
+                    value=True,
+                    key="signer_use_llm",
+                    help="Отсеивает ложные срабатывания",
+                )
+            with col_fallback2:
+                use_llm_fallback2 = st.checkbox(
+                    "🤖 LLM-fallback",
+                    value=False,
+                    key="signer_llm_fallback",
+                    help="Если regex нашёл <N мест → LLM ищет напрямую",
+                )
 
-                    with st.spinner("Определяю сторону подписанта через LLM..."):
-                        result = resolve_party(doc, signer_name, company, parties_list)
+            resolve_btn_disabled = not signer_name.strip()
 
-                    st.session_state["resolved_party"] = result
-                    _handle_resolved_party(doc, parties_list, result, use_llm)
+            if st.button(
+                "🧠 Определить сторону через Claude",
+                type="primary",
+                disabled=resolve_btn_disabled,
+            ):
+                with st.spinner("LLM определяет сторону подписанта..."):
+                    try:
+                        result = resolve_party(
+                            doc,
+                            signer_name=signer_name.strip(),
+                            company=signer_company.strip() if signer_company else None,
+                            parties=parties_list,
+                        )
+                        st.session_state["resolved_party"] = result
+                    except Exception as e:
+                        st.session_state["resolved_party"] = {"error": str(e)}
+                st.rerun()
 
             if "resolved_party" in st.session_state:
-                r = st.session_state["resolved_party"]
-                if r.get("error"):
-                    st.error(f"❌ {r['error']}")
-                elif r.get("party"):
-                    conf = r["confidence"]
-                    if conf >= 0.7:
-                        st.success(f"✅ Сторона: **{_party_label(r['party'])}** (confidence {conf:.2f})")
-                    elif conf >= 0.5:
-                        st.warning(f"⚠️ Сторона определена со средней уверенностью: "
-                                   f"**{_party_label(r['party'])}** (confidence {conf:.2f})")
+                result = st.session_state["resolved_party"]
+                if result.get("error"):
+                    st.error(f"Ошибка резолвинга: {result['error']}")
+                elif not result.get("party"):
+                    st.warning("LLM не смог определить сторону из реестра.")
+                else:
+                    party_name = result["party"]
+                    confidence = result.get("confidence", 0.0)
+                    reasoning = result.get("reasoning", "")
+
+                    if confidence >= 0.5:
+                        st.success(
+                            f"✅ Сторона: **{party_name}** (confidence {confidence:.2f})"
+                        )
+                        if reasoning:
+                            with st.expander("💬 Reasoning", expanded=False):
+                                st.caption(reasoning)
+
+                        # Защита от повторного входа
+                        already_triggered = st.session_state.get("search_triggered_for") == party_name
+                        if not already_triggered:
+                            if st.button(
+                                f"🔍 Найти места подписи для '{party_name}'",
+                                type="primary",
+                                key="auto_search_btn",
+                            ):
+                                st.session_state["search_triggered_for"] = party_name
+                                _run_search(doc, parties_list, party_name, use_llm2, use_llm_fallback2)
+                                st.session_state.pop("resolved_party", None)
+                                st.session_state.pop("search_triggered_for", None)
+                                st.rerun()
+                        else:
+                            st.info("Поиск запущен...")
                     else:
-                        st.error(f"❌ Сторона не определена однозначно (confidence {conf:.2f}). "
-                                 "Уточните ФИО или добавьте компанию, или используйте режим 'По роли'.")
-                    if r.get("evidence"):
-                        st.caption(f"💬 Цитата: «{r['evidence']}»")
+                        st.warning(
+                            f"⚠ LLM предполагает сторону '{party_name}' "
+                            f"(confidence {confidence:.2f}), но уверенности мало."
+                        )
+                        if reasoning:
+                            with st.expander("💬 Reasoning", expanded=False):
+                                st.caption(reasoning)
+                        if st.button("▶ Искать принудительно"):
+                            _run_search(doc, parties_list, party_name, use_llm2, use_llm_fallback2)
 
 
-# ── РЕЗУЛЬТАТ ────────────────────────────────────────────────────────────────
+# ── РЕЗУЛЬТАТЫ ПОИСКА ────────────────────────────────────────────────────────
 if "matches" in st.session_state and "parsed_doc" in st.session_state:
     st.divider()
-    st.subheader("✅ Результат поиска")
+    st.subheader("📍 Результаты поиска")
     doc = st.session_state["parsed_doc"]
     all_matches = st.session_state["matches"]
-    confirmed = [m for m in all_matches if m.status not in ("rejected_by_llm", "decorative")]
-    rejected  = [m for m in all_matches if m.status in  ("rejected_by_llm", "decorative")]
+    confirmed = [m for m in all_matches if m.status == "candidate"]
+    rejected = [m for m in all_matches if m.status in ("rejected_by_llm", "decorative")]
 
-    if not all_matches:
-        st.warning("Ничего не найдено по выбранным паттернам.")
+    if not confirmed and not rejected:
+        st.warning("⚠ Места подписи не найдены.")
     else:
-        cc1, cc2 = st.columns(2)
-        cc1.metric("Реальные места", len(confirmed))
-        cc2.metric("Отклонены", len(rejected))
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Найдено", len(confirmed))
+        cc2.metric("Отклонено LLM", len(rejected))
+        cc3.metric("Время поиска", f"{st.session_state.get('search_elapsed', 0)} сек")
+        source = st.session_state.get("search_source", "regex")
+        source_label = {
+            "regex": "Regex",
+            "llm_fallback": "🤖 LLM-fallback",
+            "template": "📋 Шаблон",
+            "manual": "🖱 Ручная разметка",
+            "regex_empty": "Regex (0)",
+        }.get(source, source)
+        cc4.metric("Источник", source_label)
 
-        # Кнопка экспорта JSON (v1.4.0)
-        export_json = _export_results_json()
-        st.download_button(
-            "📥 Экспорт JSON",
-            data=export_json,
-            file_name=f"signfinder_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-        )
+        st.markdown("##### Места для подписи")
+        st.caption("✅ — подтверждённые · ⚠ — отклонены LLM (снимите галку чтобы исключить, поставьте чтобы переопределить LLM)")
 
-        st.markdown("##### Места для подписи (снимите галку чтобы исключить)")
+        # ── Подтверждённые места ────────────────────────────────────────────
         for m in confirmed:
             cb_key = f"include_{m.id}"
             if cb_key not in st.session_state:
@@ -353,21 +396,104 @@ if "matches" in st.session_state and "parsed_doc" in st.session_state:
             )
             m.operator_excluded = not include
 
-        st.markdown("##### Предпросмотр (красные рамки = места подписи)")
-        for page_num in sorted({m.page for m in confirmed}):
-            page_matches = [m for m in confirmed if m.page == page_num]
+        # ── Отклонённые LLM — показываем с чекбоксом default=False (BUG-02) ─
+        if rejected:
+            st.markdown("---")
+            st.caption("Ниже — места отклонённые LLM. Включите чекбокс чтобы переопределить.")
+            for m in rejected:
+                cb_key = f"include_{m.id}"
+                if cb_key not in st.session_state:
+                    st.session_state[cb_key] = False  # по умолчанию выключено
+                include = st.checkbox(
+                    f"~~{m.id}~~ · стр. {m.page + 1} · ⚠ отклонено LLM · `{m.context[:80]}...`",
+                    value=st.session_state[cb_key],
+                    key=cb_key,
+                )
+                if include:
+                    m.operator_excluded = False
+                    m.status = "candidate"  # оператор переопределяет LLM
+                else:
+                    m.operator_excluded = True
+
+        # ── Все активные = подтверждённые + переопределённые ─────────────────
+        active_matches = [m for m in all_matches if not m.operator_excluded]
+
+        st.markdown("##### Предпросмотр (красные рамки = активные места подписи)")
+        
+        # Собираем страницы для показа: первая, последняя, страницы с активными местами
+        pages_with_matches = sorted({m.page for m in active_matches})
+        pages_to_show = set(pages_with_matches)
+        pages_to_show.add(0)  # первая
+        if len(doc.pages) > 1:
+            pages_to_show.add(len(doc.pages) - 1)  # последняя
+        
+        for page_num in sorted(pages_to_show):
+            page_matches = [m for m in active_matches if m.page == page_num]
             try:
                 png = render_page_with_highlights(doc.pdf_bytes, page_num, page_matches)
-                st.image(png, caption=f"Страница {page_num + 1}")
+                caption = f"Страница {page_num + 1}"
+                if page_num == 0:
+                    caption += " (первая)"
+                elif page_num == len(doc.pages) - 1 and page_num != 0:
+                    caption += " (последняя)"
+                st.image(png, caption=caption)
             except Exception as e:
                 st.error(f"Ошибка рендера стр. {page_num + 1}: {e}")
+
+        # ── JSON экспорт ──────────────────────────────────────────────────────
+        from datetime import datetime, timezone
+        export_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "doc_info": {
+                "filename": doc.filename,
+                "pages": len(doc.pages),
+                "language": doc.language,
+                "size_bytes": len(doc.pdf_bytes),
+            },
+            "search_config": st.session_state.get("search_config", {}),
+            "results": {
+                "total_found": len(confirmed),
+                "after_validation": len(confirmed),
+                "rejected_by_llm": len(rejected),
+                "processing_time_seconds": st.session_state.get("search_elapsed", 0),
+            },
+            "matches": [
+                {
+                    "id": m.id,
+                    "page": m.page,
+                    "bbox": list(m.bbox),
+                    "pattern": m.pattern,
+                    "context": m.context,
+                    "confidence": m.confidence,
+                    "status": m.status,
+                    "operator_excluded": m.operator_excluded,
+                }
+                for m in confirmed
+            ],
+            "rejected": [
+                {
+                    "id": m.id,
+                    "page": m.page,
+                    "reason": m.status,
+                    "pattern": m.pattern,
+                    "context": m.context,
+                }
+                for m in rejected
+            ],
+        }
+        st.download_button(
+            "📥 Экспорт JSON (диагностика)",
+            data=json.dumps(export_data, ensure_ascii=False, indent=2),
+            file_name=f"signfinder_{doc.filename.rsplit('.', 1)[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+        )
 
         st.divider()
         st.markdown("##### Наложение подписи")
         flatten = st.checkbox("🔒 Защитить от редактирования (flatten PDF)", value=False)
 
         if st.button("▶ Применить подпись", type="primary"):
-            active = [m for m in confirmed if not m.operator_excluded]
+            active = [m for m in all_matches if not m.operator_excluded]
             if not active:
                 st.error("Все места исключены.")
             else:
@@ -375,7 +501,7 @@ if "matches" in st.session_state and "parsed_doc" in st.session_state:
                     try:
                         signed = apply_signature(
                             doc.pdf_bytes,
-                            confirmed,
+                            active,
                             st.session_state["signature_png"],
                             flatten=flatten,
                         )
@@ -383,10 +509,6 @@ if "matches" in st.session_state and "parsed_doc" in st.session_state:
                     except Exception as e:
                         st.error(f"Ошибка наложения: {e}")
 
-        if rejected:
-            with st.expander(f"🚫 Отклонены ({len(rejected)})"):
-                for m in rejected:
-                    st.caption(f"{m.id} · стр. {m.page + 1} · {m.correction_applied or m.status} · `{m.context[:80]}`")
 
 # ── ИТОГОВЫЙ PDF ─────────────────────────────────────────────────────────────
 if "signed_pdf" in st.session_state and "parsed_doc" in st.session_state:
@@ -401,67 +523,28 @@ if "signed_pdf" in st.session_state and "parsed_doc" in st.session_state:
         mime="application/pdf",
     )
     st.markdown("##### Превью результата")
-    confirmed = [m for m in st.session_state["matches"] if m.status not in ("rejected_by_llm", "decorative")]
-    for page_num in sorted({m.page for m in confirmed}):
+    active_matches = [m for m in st.session_state["matches"] if not m.operator_excluded]
+    
+    # Собираем страницы: первая, последняя, страницы с активными местами
+    pages_with_matches = sorted({m.page for m in active_matches})
+    pages_to_show = set(pages_with_matches)
+    pages_to_show.add(0)  # первая
+    if len(doc.pages) > 1:
+        pages_to_show.add(len(doc.pages) - 1)  # последняя
+    
+    for page_num in sorted(pages_to_show):
         try:
             png = render_page_with_highlights(signed, page_num, [])
-            st.image(png, caption=f"Страница {page_num + 1} (подписанная)")
+            caption = f"Страница {page_num + 1} (подписанная)"
+            if page_num == 0:
+                caption = f"Страница {page_num + 1} (подписанная, первая)"
+            elif page_num == len(doc.pages) - 1 and page_num != 0:
+                caption = f"Страница {page_num + 1} (подписанная, последняя)"
+            st.image(png, caption=caption)
         except Exception as e:
             st.error(f"Ошибка рендера стр. {page_num + 1}: {e}")
 
 
-# ── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
 st.divider()
-with st.expander("⚙️ Настройки", expanded=False):
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("parties.json")
-        try:
-            if json_config_exists("parties.json"):
-                import json as _json
-                raw_json = _json.dumps(read_json("parties.json"), ensure_ascii=False, indent=2)
-            else:
-                raw_json = "{}"
-        except Exception as e:
-            st.error(f"Ошибка чтения parties.json: {e}")
-            raw_json = "{}"
-
-        new_json_str = st.text_area(
-            "Реестр сторон (JSON)",
-            value=raw_json,
-            height=400,
-            key="parties_json_editor",
-            label_visibility="collapsed",
-        )
-        if st.button("💾 Сохранить parties.json"):
-            try:
-                import json as _json
-                parsed_json = _json.loads(new_json_str)
-                backup = write_json("parties.json", parsed_json)
-                st.success(f"Сохранено. Бэкап: {backup}")
-            except Exception as e:
-                st.error(f"Невалидный JSON: {e}")
-
-    with col2:
-        st.subheader("corrections.md")
-        try:
-            corrections_content = read_md("corrections.md")
-        except Exception as e:
-            st.error(f"Не удалось прочитать corrections.md: {e}")
-            corrections_content = ""
-        new_corrections = st.text_area(
-            "База корректировок",
-            value=corrections_content,
-            height=400,
-            key="corrections_editor",
-            label_visibility="collapsed",
-        )
-        if st.button("💾 Сохранить corrections.md"):
-            backup = write_md("corrections.md", new_corrections)
-            st.success(f"Сохранено. Бэкап: {backup}")
-
-
-st.divider()
+st.caption("SignFinder MVP v1.4.2")
 st.markdown("[📋 ТЗ SignFinder MVP Requirements](https://github.com/alexgeorg2507-creator/SignPDFMVP/blob/main/SignPDFMVP)")
-st.caption("SignFinder MVP v1.4.0 — май 2026")

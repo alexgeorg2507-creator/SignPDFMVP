@@ -60,10 +60,16 @@ c1.metric("Файл", doc.filename)
 c2.metric("Страниц", len(doc.pages))
 c3.metric("Язык", doc.language.upper())
 
-with st.expander("👁 Превью первой страницы", expanded=False):
+with st.expander("👁 Превью первой и последней страницы", expanded=False):
     try:
-        thumb = render_page_with_highlights(doc.pdf_bytes, 0, [])
-        st.image(thumb, caption="Страница 1", width=500)
+        # Первая страница
+        thumb_first = render_page_with_highlights(doc.pdf_bytes, 0, [])
+        st.image(thumb_first, caption="Страница 1 (первая)", width=500)
+        
+        # Последняя страница (если есть)
+        if len(doc.pages) > 1:
+            thumb_last = render_page_with_highlights(doc.pdf_bytes, len(doc.pages) - 1, [])
+            st.image(thumb_last, caption=f"Страница {len(doc.pages)} (последняя)", width=500)
     except Exception as e:
         st.caption(f"Не удалось отрисовать: {e}")
 
@@ -245,11 +251,24 @@ if "train_test_matches" in st.session_state:
         if rejected:
             msg += f" · LLM отклонил {len(rejected)} ложных"
         st.success(msg)
-        for page_num in sorted({m.page for m in active}):
+        
+        # Собираем страницы: первая, последняя, страницы с активными местами
+        pages_with_matches = sorted({m.page for m in active})
+        pages_to_show = set(pages_with_matches)
+        pages_to_show.add(0)  # первая
+        if len(doc.pages) > 1:
+            pages_to_show.add(len(doc.pages) - 1)  # последняя
+        
+        for page_num in sorted(pages_to_show):
             page_matches = [m for m in active if m.page == page_num]
             try:
                 png = render_page_with_highlights(doc.pdf_bytes, page_num, page_matches)
-                st.image(png, caption=f"Страница {page_num + 1}")
+                caption = f"Страница {page_num + 1}"
+                if page_num == 0:
+                    caption += " (первая)"
+                elif page_num == len(doc.pages) - 1 and page_num != 0:
+                    caption += " (последняя)"
+                st.image(png, caption=caption)
             except Exception as e:
                 st.caption(f"Ошибка рендера стр. {page_num + 1}: {e}")
 

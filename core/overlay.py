@@ -21,6 +21,7 @@ def apply_signature(pdf_bytes: bytes, matches: list, png_bytes: bytes, flatten: 
             continue
 
         page = doc[m.page]
+        page_rect = page.rect  # границы страницы
         anchor_x, anchor_y_bottom, line_height = _find_underscore_anchor(page, m.bbox, m.pattern)
 
         sig_h = max(MIN_SIGNATURE_HEIGHT_PT, line_height * LINE_HEIGHT_MULTIPLIER)
@@ -32,6 +33,15 @@ def apply_signature(pdf_bytes: bytes, matches: list, png_bytes: bytes, flatten: 
             anchor_x + sig_w,
             anchor_y_bottom,
         )
+
+        # Клипаем к границам страницы — иначе fitz растягивает изображение на весь лист
+        sig_rect = sig_rect & page_rect
+
+        # Пропускаем если rect невалидный (нулевая площадь или инвертированный)
+        if sig_rect.is_empty or sig_rect.is_infinite or sig_rect.width < 5 or sig_rect.height < 5:
+            print(f"[overlay] skip match {m.id}: invalid sig_rect {sig_rect}", flush=True)
+            continue
+
         page.insert_image(sig_rect, stream=png_bytes, keep_proportion=True)
 
     out_bytes = doc.tobytes(deflate=True)

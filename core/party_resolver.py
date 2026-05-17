@@ -138,6 +138,9 @@ def _call_llm(doc_text: str, signer_name: str, company: str | None,
     parties_str = _build_parties_list_str(parties)
     company_line = f'Компания: "{company}"' if company else "Компания: (не указана)"
 
+    from core.prompts import get_party_resolver_rules
+    _resolver_rules = get_party_resolver_rules()
+
     prompt = f"""Фрагмент договора (первые символы):
 ---
 {doc_text}
@@ -152,10 +155,7 @@ def _call_llm(doc_text: str, signer_name: str, company: str | None,
 Задача: определи, на какой стороне договора выступает указанный подписант или компания.
 
 Правила:
-- Подписант и компания могут указывать на разные стороны — приоритет AND-совпадение (оба указывают на одну сторону).
-- Если совпадение только по одному критерию — допустимо, но снизь confidence.
-- Если ни одного совпадения в тексте — confidence = 0, party = null.
-- Поле "party" должно ТОЧНО совпадать с одним из ключей в списке выше (русским названием).
+{_resolver_rules}
 
 Верни ТОЛЬКО JSON без обрамления markdown, без пояснений:
 {{"party": "<точное имя из списка или null>", "confidence": <число 0..1>, "evidence": "<цитата из договора, до 200 символов>"}}

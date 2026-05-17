@@ -36,7 +36,7 @@ def extract_patterns(
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return _error("ANTHROPIC_API_KEY не задан")
 
-    doc_text = _get_doc_text(doc, max_chars=5000)
+    doc_text = _get_doc_text(doc, max_chars=None)  # v1.4: анализируем весь документ
     if not doc_text.strip():
         return _error("Не удалось извлечь текст из документа")
 
@@ -87,18 +87,26 @@ def merge_patterns_into_json(
 
 # ── Внутренние ───────────────────────────────────────────────────────────────
 
-def _get_doc_text(doc, max_chars: int) -> str:
+def _get_doc_text(doc, max_chars: int | None) -> str:
+    """Извлекает текст документа. Если max_chars=None — весь текст, иначе — до лимита."""
     buf = []
     total = 0
     for i, page in enumerate(doc.pages):
         text = page.text or ""
         header = f"\n--- Страница {i + 1} ---\n"
         chunk = header + text
-        if total + len(chunk) >= max_chars:
-            buf.append(chunk[: max_chars - total])
-            break
-        buf.append(chunk)
-        total += len(chunk)
+        
+        if max_chars is None:
+            # Без лимита — берём весь документ
+            buf.append(chunk)
+        else:
+            # С лимитом — обрезаем
+            if total + len(chunk) >= max_chars:
+                buf.append(chunk[: max_chars - total])
+                break
+            buf.append(chunk)
+            total += len(chunk)
+    
     return "\n".join(buf)
 
 
@@ -130,6 +138,13 @@ def _call_llm(
 Учти их при анализе документа.
 """
 
+    from core.prompts import (
+        get_sign_task_rules, get_pattern_quality_rules,
+        get_pattern_from_lines_rules, get_pattern_narrow_strategies,
+    )
+    _task_rules     = get_sign_task_rules()
+    _quality_rules  = get_pattern_quality_rules()
+
     lang_hint = {"ru": "русском", "en": "английском", "pl": "польском"}.get(language, language)
 
     prompt = f"""Анализируй договор на {lang_hint} языке. Найди все места где ПОДПИСЫВАЕТ сторона "{party_name}".
@@ -139,147 +154,58 @@ def _call_llm(
 {doc_text}
 ---
 {refinement_block}
-Задача:
-1. Найди строки/блоки с местами подписи стороны "{party_name}" — НЕ упоминания в тексте договора.
-2. Признаки места подписи: подчёркивания (___), слово "Подпись", скобки с ФИО, роль + линия.
-3. Для каждого места составь regex-паттерн.
+{_task_rules}
 
-КРИТИЧЕСКИ ВАЖНО для паттернов:
-- Ты пишешь паттерны внутри JSON-строк, поэтому обратный слэш НУЖНО удваивать
-- ПРАВИЛЬНО:  "Арендатор[\\s_]*_{3,}"   (в JSON \\s = реальный \s в regex)
-- НЕПРАВИЛЬНО: "Арендатор[\s_]*_{3,}"   (в JSON \s — невалидный escape, сломает парсинг)
-- Аналогично: \\s  \\S  \\d  \\w  \\n — всегда с двойным слэшем внутри JSON-строки
-- _{3,} — три и более подчёркивания (слэш не нужен, это литерал)
-- Без привязки к конкретным ФИО — только роли и структура строки
-- Без якорей ^ и $
+{_quality_rules}
 
-СПЕЦИФИЧНОСТЬ ПАТТЕРНОВ — главное требование:
-- ОТДЕЛЬНЫЙ узкий паттерн под КАЖДОЕ найденное место, а не один общий
-- ЗАПРЕЩЕНЫ жадные конструкции без ограничения длины: НЕ пиши [\\s_]* — пиши [\\s_]{{0,5}}
-- ЗАПРЕЩЕНО .* без ограничения — пиши .{{0,30}}
-- Добавляй якоря КОНТЕКСТА вокруг линии подписи, не только саму роль:
-  - плохо:  "Подпись_{3,}"   (поймает любую подпись на странице)
-  - хорошо: "адресу[\\s\\S]{{0,200}}Подпись_{3,}"   (привязка к ближайшему якорю)
-- Количество паттернов должно примерно соответствовать количеству найденных мест
-
-Примеры правильных паттернов в JSON:
-- "Арендатор:[\\s]{{0,3}}_{3,}[\\s]{{0,5}}_{3,}"   (узкий: двоеточие + 2 линии)
-- "_{3,}[\\s\\n]{{0,5}}\\(Арендатор"             (узкий: линия + скобка-аннотация)
-- "адресу[\\s\\S]{{0,300}}Подпись_{3,}"          (с контекстом до якоря Подпись)
-
-Верни ТОЛЬКО валидный JSON без markdown и пояснений:
+Верни ТОЛЬКО JSON-объект без markdown:
 {{
-  "patterns": ["паттерн1", "паттерн2"],
+  "reasoning": "краткое объяснение где нашёл места подписи",
   "found_locations": [
-    {{"page": 1, "line": "точная строка из документа", "context": "несколько слов вокруг"}}
+    {{"page": 1, "line": "точный текст строки", "context": "контекст вокруг"}}
   ],
-  "reasoning": "кратко: что нашёл и почему такие паттерны"
-}}
-
-ОБЯЗАТЕЛЬНО: массив "patterns" не должен быть пустым если нашёл места подписи."""
-
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    if not resp.content:
-        raise ValueError("LLM вернул пустой ответ (content пустой)")
-
-    raw = (resp.content[0].text or "").strip()
-    print(f"[pattern_extractor] raw LLM response ({len(raw)} chars): {raw[:300]}")
-
-    # Убираем markdown-обёртки — поддержка многострочных блоков
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.DOTALL).strip()
-    raw = re.sub(r"\s*```$", "", raw, flags=re.DOTALL).strip()
-
-    if not raw:
-        raise ValueError("LLM вернул пустой ответ после стрипки markdown")
-
-    # Ищем JSON-объект даже если LLM добавил пояснения до/после
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if json_match:
-        raw = json_match.group(0)
-
-    data = json.loads(raw)
-    data["error"] = None
-
-    # При refinement ВСЕГДА перегенерируем паттерны под актуальные locations.
-    # LLM имеет привычку копировать старые patterns не пересматривая их под новые места.
-    # Иначе fallback только для пустых patterns.
-    if data.get("found_locations"):
-        if refinement:
-            data["patterns"] = _extract_patterns_from_locations(
-                client, party_name, data["found_locations"]
-            )
-        elif not data.get("patterns"):
-            data["patterns"] = _extract_patterns_from_locations(
-                client, party_name, data["found_locations"]
-            )
-
-    # Самопроверка №1: паттерны находят хоть что-то?
-    # Если нет — перегенерация с сырым текстом страниц.
-    if doc is not None and data.get("patterns") and data.get("found_locations"):
-        if not _patterns_match_anything(data["patterns"], doc):
-            regen = _regenerate_from_raw_text(
-                client, party_name, data["found_locations"], doc
-            )
-            if regen:
-                data["patterns"] = regen
-
-    # Самопроверка №2: паттерны не слишком жадные?
-    # Если суммарный count матчей > 1.5 * count(locations) — паттерны ловят шум, нужно сузить.
-    if doc is not None and data.get("patterns") and data.get("found_locations"):
-        expected = len(data["found_locations"])
-        actual = _count_matches(data["patterns"], doc)
-        if expected > 0 and actual > expected * 1.5:
-            narrowed = _narrow_patterns(
-                client, party_name, data["patterns"], data["found_locations"], doc, actual
-            )
-            if narrowed:
-                # Применяем только если новые паттерны находят разумное количество
-                new_count = _count_matches(narrowed, doc)
-                if new_count > 0 and new_count <= actual:
-                    data["patterns"] = narrowed
-
-    return data
-
-
-def _extract_patterns_from_locations(client, party_name: str, locations: list[dict]) -> list[str]:
-    """Fallback: генерирует паттерны на основе найденных строк."""
-    lines_str = "\n".join(
-        f'- стр.{loc.get("page","?")}: {loc.get("line", loc.get("context", ""))}'
-        for loc in locations[:10]
-    )
-
-    prompt = f"""Вот строки из договора — места подписи стороны "{party_name}":
-{lines_str}
-
-Составь regex-паттерны для поиска этих строк в тексте.
-
-КРИТИЧЕСКИ: паттерны внутри JSON-строк — обратный слэш УДВАИВАТЬ:
-- ПРАВИЛЬНО:  "Арендатор[\\s_]*_{{3,}}"
-- НЕПРАВИЛЬНО: "Арендатор[\\s_]*_{{3,}}"  (одинарный \s сломает JSON)
-
-Верни ТОЛЬКО JSON-массив строк без markdown:
-["паттерн1", "паттерн2"]"""
+  "patterns": ["regex1", "regex2"]
+}}"""
 
     try:
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=600,
+            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = (resp.content[0].text or "").strip()
         raw = re.sub(r"^```(?:json)?", "", raw).strip()
         raw = re.sub(r"```$", "", raw).strip()
-        result = json.loads(raw)
-        if isinstance(result, list):
-            return [p for p in result if isinstance(p, str)]
-    except Exception:
-        pass
-    return []
+
+        # Попытка 1: полный JSON
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                return {
+                    "patterns": [p for p in result.get("patterns", []) if isinstance(p, str)],
+                    "found_locations": result.get("found_locations", []),
+                    "reasoning": result.get("reasoning", ""),
+                    "error": None,
+                }
+        except json.JSONDecodeError:
+            pass
+
+        # Попытка 2: обрезанный JSON — вытаскиваем паттерны regex-ом
+        patterns_found = re.findall(r'"((?:[^"\\]|\\.)+)"', raw)
+        # Фильтруем — паттерны содержат спецсимволы regex
+        regex_like = [p for p in patterns_found if any(c in p for c in r'[\(\_\+\*\?\{\^$|')]
+        if regex_like:
+            return {
+                "patterns": regex_like,
+                "found_locations": [],
+                "reasoning": "JSON был обрезан — паттерны извлечены частично",
+                "error": None,
+            }
+
+        return _error(f"Не удалось распарсить ответ LLM: {raw[:200]}")
+
+    except Exception as e:
+        return _error(f"LLM error: {e}")
 
 
 def _patterns_match_anything(patterns: list[str], doc) -> bool:
@@ -327,6 +253,10 @@ def _regenerate_from_raw_text(
         return []
 
     locations_str = json.dumps(locations[:5], ensure_ascii=False, indent=2)
+
+    from core.prompts import get_pattern_from_lines_rules, get_pattern_narrow_strategies
+    _from_lines_rules = get_pattern_from_lines_rules()
+    _narrow_strategies = get_pattern_narrow_strategies()
 
     prompt = f"""ВАЖНО: предыдущие сгенерированные паттерны не нашли ни одного места в реальном тексте документа.
 Нужно создать паттерны на основе ТОЧНОГО сырого текста как он извлекается из PDF.
@@ -452,12 +382,7 @@ def _narrow_patterns(
 
 Задача: переписать паттерны так чтобы они находили РОВНО {expected} мест.
 
-Стратегии сужения:
-- Добавить уникальный контекст ПЕРЕД местом подписи (соседнее предложение, маркер блока)
-- Заменить жадные [\\s_]* на [\\s_]{{0,5}} или [\\s_]{{1,10}}
-- Использовать .{{0,200}} вместо .* для контекстных якорей через несколько строк
-- Если два паттерна дублируются по матчам — оставить один более специфичный
-- НЕ использовать конкретные ФИО (паттерны должны работать на других документах)
+{_narrow_strategies}
 
 КРИТИЧЕСКИ для JSON: \\s, \\S, \\d, \\w, \\n — с ДВОЙНЫМ слэшем.
 

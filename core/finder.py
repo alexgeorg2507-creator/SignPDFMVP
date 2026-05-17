@@ -270,3 +270,38 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         pdf_doc.close()
 
     return matches
+
+# ── LLM-fallback (v1.4.2) ────────────────────────────────────────────────────
+
+def find_signatures_smart(
+    doc: ParsedDocument,
+    party: dict,
+    min_expected: int = 1,
+    llm_fallback: bool = True,
+) -> tuple[list[SignMatch], str]:
+    """Умный поиск с LLM-fallback.
+
+    Параметры:
+        doc — ParsedDocument
+        party — party dict из parse_parties_json()
+        min_expected — минимум ожидаемых мест (если regex < min → LLM)
+        llm_fallback — включён ли LLM-fallback
+
+    Возвращает:
+        (matches, source) где source = "regex" | "llm_fallback"
+    """
+    # Сначала пробуем regex
+    matches = find_signatures(doc, party)
+
+    if len(matches) >= min_expected:
+        return matches, "regex"
+
+    # Regex не нашёл достаточно → LLM-fallback
+    if llm_fallback:
+        from core.llm_finder import find_signatures_llm
+        llm_matches = find_signatures_llm(doc, party["name"], doc.language)
+        if llm_matches:
+            return llm_matches, "llm_fallback"
+
+    # Fallback не помог или выключен — возвращаем что есть
+    return matches, "regex"
