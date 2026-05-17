@@ -114,13 +114,13 @@ if not sig_ready:
     with col1:
         st.warning("⚠️ Подпись не загружена.")
     with col2:
-        st.page_link("pages/4_⚙️_Настройки.py", label="Загрузить", icon="⚙️")
+        st.page_link("pages/4____Настройки.py", label="Загрузить", icon="⚙️")
 else:
     col1, col2 = st.columns([3, 1], vertical_alignment="center")
     with col1:
         st.success("✅ Подпись загружена")
     with col2:
-        st.page_link("pages/4_⚙️_Настройки.py", label="Изменить", icon="⚙️")
+        st.page_link("pages/4____Настройки.py", label="Изменить", icon="⚙️")
 
 
 # ── ШАГ 1: ДОКУМЕНТ ──────────────────────────────────────────────────────────
