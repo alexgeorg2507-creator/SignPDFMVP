@@ -13,7 +13,8 @@ steps:
       - --max-instances=1
       - --timeout=300
       - --allow-unauthenticated
-      - --set-env-vars=ACCESS_CODE=$_ACCESS_CODE,ANTHROPIC_API_KEY=$_ANTHROPIC_API_KEY,GCS_BUCKET=signfinder-config
+      - --update-secrets=ACCESS_CODE=ACCESS_CODE:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest
+      - --set-env-vars=GCS_BUCKET=signfinder-config
 timeout: 1200s
 options:
   logging: CLOUD_LOGGING_ONLY
