@@ -3,17 +3,17 @@
 Streamlit multi-page: pages/4_⚙️_Настройки.py
 
 Содержит:
-- parties.json — CRUD-редактор сторон договора (перенесено из 2_Шаблоны)
-- corrections.md — база корректировок (перенесено из expander app.py)
+- parties.json — CRUD-редактор сторон договора
+- corrections.md — база корректировок
+- Промпты — редактирование статичных блоков
+- Подписант — signer_profile.json (v1.5)
+- Маркеры подписи — markers.json (v1.5)
 """
 import json
 
 import streamlit as st
 
-from core.storage import (
-    json_config_exists, read_json, write_json, read_md, write_md,
-    read_signature, write_signature, delete_signature,
-)
+from core.storage import json_config_exists, read_json, write_json, read_md, write_md
 from core.prompts import load_prompts, save_prompts, PROMPT_META, DEFAULTS as PROMPT_DEFAULTS
 
 st.set_page_config(page_title="Настройки — SignFinder", layout="wide")
@@ -26,66 +26,13 @@ st.title("⚙️ Настройки SignFinder")
 
 LANGUAGES = ["ru", "en", "pl"]
 
-tab_signature, tab_parties, tab_corrections, tab_prompts = st.tabs([
-    "🖊 Подпись",
+tab_parties, tab_corrections, tab_prompts, tab_signer, tab_markers = st.tabs([
     "📋 Стороны (parties.json)",
     "🔧 Корректировки (corrections.md)",
     "🤖 Промпты",
+    "👤 Подписант",
+    "🔖 Маркеры подписи",
 ])
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ТАБ 0: Подпись
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_signature:
-    st.caption("Загрузка и управление подписью оператора (PNG с прозрачным фоном)")
-    
-    # Автозагрузка сохранённой подписи
-    if "signature_png" not in st.session_state:
-        saved = read_signature()
-        if saved:
-            st.session_state["signature_png"] = saved
-    
-    # Upload
-    sig_upload = st.file_uploader(
-        "Загрузить PNG подписи (прозрачный фон, обязательно)",
-        type=["png"],
-        key="settings_sig_uploader",
-    )
-    if sig_upload is not None:
-        png_bytes = sig_upload.getvalue()
-        st.session_state["signature_png"] = png_bytes
-        try:
-            write_signature(png_bytes)
-            st.success("✅ Подпись сохранена в хранилище")
-        except Exception as e:
-            st.error(f"Ошибка сохранения: {e}")
-    
-    # Status
-    if "signature_png" in st.session_state:
-        st.success("✅ Подпись загружена")
-        
-        # Превью на белом фоне — image через base64 внутри div
-        import base64
-        img_b64 = base64.b64encode(st.session_state["signature_png"]).decode()
-        st.markdown(
-            f'<div style="background-color: white; padding: 15px; border-radius: 5px; '
-            f'border: 1px solid #ddd; margin: 10px 0;">'
-            f'<img src="data:image/png;base64,{img_b64}" style="max-width: 400px; display: block;">'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-        
-        # Кнопка забыть
-        if st.button("🗑 Забыть подпись", help="Удалить сохранённую подпись из хранилища", key="settings_forget_sig"):
-            st.session_state.pop("signature_png", None)
-            try:
-                delete_signature()
-                st.success("Подпись удалена")
-            except Exception as e:
-                st.error(f"Ошибка удаления: {e}")
-            st.rerun()
-    else:
-        st.info("⬆ Загрузите PNG подписи выше")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ТАБ 1: parties.json
@@ -341,3 +288,157 @@ with tab_prompts:
                     st.warning("⚠️ Отличается от дефолта")
                 else:
                     st.success("✓ Дефолтное значение")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ТАБ 4: Подписант (signer_profile.json)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_signer:
+    st.caption("Данные подписанта: компания и ФИО на разных языках. Используются в авто-пайплайне для определения нашей стороны в договоре.")
+
+    from core.signer_profile import load_signer_profile, save_signer_profile
+
+    if "signer_profile_data" not in st.session_state:
+        st.session_state["signer_profile_data"] = load_signer_profile()
+
+    sp = st.session_state["signer_profile_data"]
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _render_alias_table(alias_list: list, prefix: str) -> list:
+        """Рисует строки алиасов, возвращает обновлённый список."""
+        to_delete = []
+        for i, alias in enumerate(alias_list):
+            c1, c2, c3 = st.columns([2, 6, 1])
+            with c1:
+                opts = LANGUAGES
+                cur_lang = alias.get("language", "ru")
+                idx = opts.index(cur_lang) if cur_lang in opts else 0
+                alias["language"] = st.selectbox(
+                    "Язык",
+                    options=opts,
+                    index=idx,
+                    key=f"{prefix}_lang_{i}",
+                    label_visibility="collapsed",
+                )
+            with c2:
+                alias["value"] = st.text_input(
+                    "Значение",
+                    value=alias.get("value", ""),
+                    key=f"{prefix}_val_{i}",
+                    label_visibility="collapsed",
+                )
+            with c3:
+                if st.button("🗑", key=f"{prefix}_del_{i}"):
+                    to_delete.append(i)
+
+        for idx in sorted(to_delete, reverse=True):
+            alias_list.pop(idx)
+
+        if to_delete:
+            st.rerun()
+
+        return alias_list
+
+    # ── Компания ──────────────────────────────────────────────────────────────
+    st.subheader("Алиасы компании")
+    st.caption("Юридическое название на разных языках. Опционально — можно оставить пустым.")
+
+    if not sp.get("company_aliases"):
+        st.info("Нет алиасов. Добавьте хотя бы один если хотите искать по названию компании.")
+
+    sp["company_aliases"] = _render_alias_table(sp.setdefault("company_aliases", []), "company")
+
+    if st.button("+ Добавить алиас компании", key="company_add"):
+        sp["company_aliases"].append({"language": "ru", "value": ""})
+        st.rerun()
+
+    st.divider()
+
+    # ── ФИО подписанта ────────────────────────────────────────────────────────
+    st.subheader("Алиасы ФИО подписанта")
+    st.caption("Фамилия, Фамилия И.И., Фамилия Имя Отчество — на разных языках. Минимум одно значение.")
+
+    if not sp.get("signer_aliases"):
+        st.warning("⚠️ Не задано ни одного алиаса ФИО. Авто-пайплайн не сможет определить нашу сторону.")
+
+    sp["signer_aliases"] = _render_alias_table(sp.setdefault("signer_aliases", []), "signer")
+
+    if st.button("+ Добавить алиас ФИО", key="signer_add"):
+        sp["signer_aliases"].append({"language": "ru", "value": ""})
+        st.rerun()
+
+    st.divider()
+
+    col_sp_save, col_sp_reload, col_sp_raw = st.columns([1, 1, 2])
+    with col_sp_save:
+        if st.button("💾 Сохранить подписанта", type="primary", key="sp_save"):
+            if not any(a.get("value", "").strip() for a in sp.get("signer_aliases", [])):
+                st.error("Нужен хотя бы один алиас ФИО.")
+            else:
+                try:
+                    backup = save_signer_profile(sp)
+                    st.success(f"Сохранено. Бэкап: {backup}")
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+    with col_sp_reload:
+        if st.button("🔄 Перечитать", key="sp_reload"):
+            st.session_state.pop("signer_profile_data", None)
+            st.rerun()
+    with col_sp_raw:
+        with st.expander("Raw JSON", expanded=False):
+            st.code(json.dumps(sp, ensure_ascii=False, indent=2), language="json")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ТАБ 5: Маркеры подписи (markers.json)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_markers:
+    st.caption("Универсальные маркеры для поиска мест подписи. Служебная настройка — редактируется редко. JSON напрямую.")
+
+    from core.markers import load_markers, save_markers, DEFAULTS as MARKERS_DEFAULTS
+
+    if "markers_data" not in st.session_state:
+        raw = load_markers()
+        st.session_state["markers_raw"] = json.dumps(raw, ensure_ascii=False, indent=2)
+
+    col_m_save, col_m_reset, col_m_reload = st.columns([1, 1, 2])
+
+    with col_m_save:
+        if st.button("💾 Сохранить маркеры", type="primary", key="markers_save"):
+            raw_text = st.session_state.get("markers_editor", "")
+            try:
+                parsed = json.loads(raw_text)
+                backup = save_markers(parsed)
+                st.success(f"Сохранено. Бэкап: {backup}")
+                st.session_state["markers_raw"] = raw_text
+            except json.JSONDecodeError as e:
+                st.error(f"Невалидный JSON: {e}")
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+
+    with col_m_reset:
+        if st.button("↩ Сбросить к дефолтам", key="markers_reset"):
+            default_text = json.dumps(MARKERS_DEFAULTS, ensure_ascii=False, indent=2)
+            st.session_state["markers_raw"] = default_text
+            try:
+                save_markers(MARKERS_DEFAULTS)
+                st.success("Сброшено к дефолтам")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+
+    with col_m_reload:
+        if st.button("🔄 Перечитать", key="markers_reload"):
+            st.session_state.pop("markers_raw", None)
+            st.session_state.pop("markers_data", None)
+            st.rerun()
+
+    st.divider()
+
+    markers_text = st.text_area(
+        "markers.json",
+        value=st.session_state.get("markers_raw", "{}"),
+        height=500,
+        key="markers_editor",
+        label_visibility="collapsed",
+    )

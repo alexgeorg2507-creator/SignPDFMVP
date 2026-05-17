@@ -158,3 +158,130 @@ def get_pattern_narrow_strategies() -> str:
 
 def get_party_resolver_rules() -> str:
     return get("party_resolver_rules")
+
+
+# ── v1.5: шаблоны для автоматического пайплайна ────────────────────────────────
+# Не редактируются через UI — структурированные промпты с JSON-выводом.
+# Форматируются через format_find_our_side() / format_generate_regex().
+
+_PROMPT_FIND_OUR_SIDE = """Ты — юридический аналитик. Анализируй ШАПКУ договора и найди НАШУ СТОРОНУ.
+
+Шапка договора:
+{header_text}
+
+Язык договора: {language}
+
+Наши данные:
+- Компания (алиасы): {company_aliases}
+- Подписант (алиасы): {signer_aliases}
+
+Универсальные маркеры подписи: {markers}
+
+Задача:
+1. Найди ВСЕ стороны договора в шапке (обычно две стороны)
+2. Для каждой стороны определи: юрлицо, роль (Арендатор, Исполнитель, Заказчик и т.п.), ФИО подписанта
+3. Определи КАКАЯ из сторон — НАША по совпадению с нашими алиасами (компания ИЛИ ФИО, фамилия первичнее)
+4. Верни синонимы НАШЕЙ стороны как они написаны в этом договоре
+
+Правила:
+- Если найдено несколько потенциальных совпадений — снизь confidence
+- Фамилия подписанта важнее имени и инициалов
+- Если ни одного совпадения — our_side_index = null
+
+Верни ТОЛЬКО JSON без markdown:
+{{
+  "all_parties": [
+    {{"legal_entity": "...", "role": "...", "signer": "..."}},
+    {{"legal_entity": "...", "role": "...", "signer": "..."}}
+  ],
+  "our_side_index": 0,
+  "our_side_synonyms": {{
+    "legal_entity": "...",
+    "roles": ["...", "..."],
+    "signer": "..."
+  }},
+  "confidence": 0.9,
+  "match_reason": "company match | signer match | both | none",
+  "evidence": "цитата из шапки где упомянута наша сторона"
+}}"""
+
+
+_PROMPT_GENERATE_REGEX = """Ты — инженер по регулярным выражениям. Создай regex-паттерны для поиска мест подписи.
+
+Сторона, для которой ищем места подписи:
+- Юрлицо: {legal_entity}
+- Роли: {roles}
+- Подписант: {signer}
+
+Маркеры подписи для языка {language}:
+- Подчёркивания (паттерны): {underline_patterns}
+- Слова-маркеры: {marker_words}
+
+Стратегические фрагменты документа:
+{strategic_fragments}
+
+Правила:
+1. Паттерны должны ловить СТРУКТУРУ "синоним стороны + маркер места подписи", НЕ конкретные ФИО
+2. Используй ВСЕ типы синонимов (роли, юрлицо, подписант — каждый отдельно)
+3. Используй маркеры из переданного списка
+4. НЕ создавай паттерны совпадающие со второй стороной
+5. Приоритетные зоны: футер страниц, конец разделов, конец договора, приложения
+6. Если в фрагментах виден явный паттерн (например "{role} _____") — обязательно включи
+
+КРИТИЧЕСКИ — паттерны внутри JSON-строк: обратный слэш УДВАИВАТЬ
+- ПРАВИЛЬНО:  "Арендатор[\\\\s_]{0,5}_{3,}"
+- НЕПРАВИЛЬНО: "Арендатор[\\s_]*_{3,}"
+- ЗАПРЕЩЕНЫ жадные .* — только .{0,50}
+
+Верни ТОЛЬКО JSON без markdown:
+{
+  "patterns": [
+    {"pattern": "...", "reason": "ловит подпись в футере страницы"},
+    {"pattern": "...", "reason": "ловит подпись в конце раздела"}
+  ]
+}"""
+
+
+def format_find_our_side(
+    header_text: str,
+    language: str,
+    company_aliases: list,
+    signer_aliases: list,
+    markers: dict,
+) -> str:
+    """Форматировать промпт определения нашей стороны."""
+    import json as _json
+    return _PROMPT_FIND_OUR_SIDE.format(
+        header_text=header_text,
+        language=language,
+        company_aliases=", ".join(company_aliases) if company_aliases else "(не указано)",
+        signer_aliases=", ".join(signer_aliases) if signer_aliases else "(не указано)",
+        markers=_json.dumps(markers, ensure_ascii=False),
+    )
+
+
+def format_generate_regex(
+    legal_entity: str,
+    roles: list,
+    signer: str,
+    language: str,
+    markers_block: dict,
+    strategic_fragments: str,
+) -> str:
+    """Форматировать промпт генерации regex-паттернов.
+
+    Использует str.replace вместо .format() — промпт содержит {} в regex-примерах.
+    """
+    substitutions = {
+        "{legal_entity}": legal_entity or "(не определено)",
+        "{roles}": ", ".join(roles) if roles else "(не определено)",
+        "{signer}": signer or "(не определено)",
+        "{language}": language,
+        "{underline_patterns}": ", ".join(markers_block.get("underline_patterns", [])),
+        "{marker_words}": ", ".join(markers_block.get("marker_words", [])),
+        "{strategic_fragments}": strategic_fragments,
+    }
+    result = _PROMPT_GENERATE_REGEX
+    for placeholder, value in substitutions.items():
+        result = result.replace(placeholder, value)
+    return result
