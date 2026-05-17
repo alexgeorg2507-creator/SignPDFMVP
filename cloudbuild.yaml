@@ -15,3 +15,5 @@ steps:
       - --allow-unauthenticated
       - --set-env-vars=ACCESS_CODE=$_ACCESS_CODE,ANTHROPIC_API_KEY=$_ANTHROPIC_API_KEY,GCS_BUCKET=signfinder-config
 timeout: 1200s
+options:
+  logging: CLOUD_LOGGING_ONLY
