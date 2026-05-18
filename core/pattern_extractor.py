@@ -36,12 +36,30 @@ def extract_patterns(
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return _error("ANTHROPIC_API_KEY не задан")
 
-    doc_text = _get_doc_text(doc, max_chars=None)  # v1.4: анализируем весь документ
+    doc_text = _get_doc_text(doc, max_chars=5000)
     if not doc_text.strip():
         return _error("Не удалось извлечь текст из документа")
 
     try:
-        return _call_llm(doc_text, party_name, language, refinement, previous_result, doc)
+        llm_result = _call_llm(doc_text, party_name, language, refinement, previous_result, doc)
+        patterns = llm_result.get("patterns", [])
+        prompt_used = llm_result.get("prompt", "")
+        raw_response = llm_result.get("raw", "")
+
+        if not patterns:
+            err = _error("LLM не вернул паттерны")
+            err["prompt"] = prompt_used
+            err["raw_response"] = raw_response
+            return err
+
+        return {
+            "patterns": patterns,
+            "found_locations": [],
+            "reasoning": "",
+            "error": None,
+            "prompt": prompt_used,
+            "raw_response": raw_response,
+        }
     except Exception as e:
         return _error(f"LLM error: {e}")
 
@@ -87,26 +105,18 @@ def merge_patterns_into_json(
 
 # ── Внутренние ───────────────────────────────────────────────────────────────
 
-def _get_doc_text(doc, max_chars: int | None) -> str:
-    """Извлекает текст документа. Если max_chars=None — весь текст, иначе — до лимита."""
+def _get_doc_text(doc, max_chars: int) -> str:
     buf = []
     total = 0
     for i, page in enumerate(doc.pages):
         text = page.text or ""
         header = f"\n--- Страница {i + 1} ---\n"
         chunk = header + text
-        
-        if max_chars is None:
-            # Без лимита — берём весь документ
-            buf.append(chunk)
-        else:
-            # С лимитом — обрезаем
-            if total + len(chunk) >= max_chars:
-                buf.append(chunk[: max_chars - total])
-                break
-            buf.append(chunk)
-            total += len(chunk)
-    
+        if total + len(chunk) >= max_chars:
+            buf.append(chunk[: max_chars - total])
+            break
+        buf.append(chunk)
+        total += len(chunk)
     return "\n".join(buf)
 
 
@@ -118,6 +128,7 @@ def _call_llm(
     previous_result: dict | None,
     doc=None,
 ) -> dict:
+    """Возвращает dict: {"patterns": list[str], "prompt": str, "raw": str}."""
     from anthropic import Anthropic
 
     client = Anthropic()
@@ -158,54 +169,26 @@ def _call_llm(
 
 {_quality_rules}
 
-Верни ТОЛЬКО JSON-объект без markdown:
-{{
-  "reasoning": "краткое объяснение где нашёл места подписи",
-  "found_locations": [
-    {{"page": 1, "line": "точный текст строки", "context": "контекст вокруг"}}
-  ],
-  "patterns": ["regex1", "regex2"]
-}}"""
+Верни ТОЛЬКО JSON-массив строк без markdown:
+["паттерн1", "паттерн2"]"""
 
+    raw = ""
     try:
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = (resp.content[0].text or "").strip()
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
-
-        # Попытка 1: полный JSON
-        try:
-            result = json.loads(raw)
-            if isinstance(result, dict):
-                return {
-                    "patterns": [p for p in result.get("patterns", []) if isinstance(p, str)],
-                    "found_locations": result.get("found_locations", []),
-                    "reasoning": result.get("reasoning", ""),
-                    "error": None,
-                }
-        except json.JSONDecodeError:
-            pass
-
-        # Попытка 2: обрезанный JSON — вытаскиваем паттерны regex-ом
-        patterns_found = re.findall(r'"((?:[^"\\]|\\.)+)"', raw)
-        # Фильтруем — паттерны содержат спецсимволы regex
-        regex_like = [p for p in patterns_found if any(c in p for c in r'[\(\_\+\*\?\{\^$|')]
-        if regex_like:
-            return {
-                "patterns": regex_like,
-                "found_locations": [],
-                "reasoning": "JSON был обрезан — паттерны извлечены частично",
-                "error": None,
-            }
-
-        return _error(f"Не удалось распарсить ответ LLM: {raw[:200]}")
-
+        raw_clean = re.sub(r"^```(?:json)?", "", raw).strip()
+        raw_clean = re.sub(r"```$", "", raw_clean).strip()
+        result = json.loads(raw_clean)
+        if isinstance(result, list):
+            patterns = [p for p in result if isinstance(p, str)]
+            return {"patterns": patterns, "prompt": prompt, "raw": raw}
     except Exception as e:
-        return _error(f"LLM error: {e}")
+        print(f"[pattern_extractor] _call_llm error: {e}, raw={raw[:200]}")
+    return {"patterns": [], "prompt": prompt, "raw": raw}
 
 
 def _patterns_match_anything(patterns: list[str], doc) -> bool:
