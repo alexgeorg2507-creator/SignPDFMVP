@@ -287,13 +287,9 @@ def _bbox_contains_signature_line(page, match_rect) -> bool:
 def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -> list[SignMatch]:
     """Базовая директива: подписант один → паттерн места подписи единообразен по всему договору.
 
-    Если паттерн сработал на ≥min_pages страницах — это "доминирующий" footer-шаблон.
-    На каждой странице где есть матч доминирующего паттерна, матчи остальных паттернов
-    отбрасываются (они скорее всего ложные срабатывания на слова "Заказчик"/"Подрядчик"
-    в теле текста, формах, приложениях).
-
-    Если доминирующих паттернов нет — возвращаем как есть (документ короткий или
-    места подписи на разных страницах разные).
+    Доминирующий паттерн = покрытие ≥ 50% от максимального покрытия среди всех паттернов
+    (и не менее min_pages). На каждой странице где есть матч доминирующего паттерна,
+    матчи остальных паттернов отбрасываются.
     """
     if not matches:
         return matches
@@ -303,7 +299,13 @@ def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -
     for m in matches:
         pattern_pages[m.pattern].add(m.page)
 
-    dominant = {p for p, pages in pattern_pages.items() if len(pages) >= min_pages}
+    if not pattern_pages:
+        return matches
+
+    max_coverage = max(len(pages) for pages in pattern_pages.values())
+    threshold = max(min_pages, int(max_coverage * 0.5))
+
+    dominant = {p for p, pages in pattern_pages.items() if len(pages) >= threshold}
     if not dominant:
         return matches
 
@@ -315,7 +317,6 @@ def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -
 
     filtered = []
     for m in matches:
-        # На странице есть доминирующий, а это другой паттерн — дроп
         if m.page in pages_with_dominant and m.pattern not in dominant:
             continue
         filtered.append(m)
