@@ -337,6 +337,7 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
             + our_side.get("roles", [])
             + [our_side["signer"]]
         ),
+        "signer": our_side.get("signer", ""),
         "other_aliases": other_aliases,
         "patterns": patterns,
         "notes": "",

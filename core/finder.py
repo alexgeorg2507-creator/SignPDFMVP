@@ -284,12 +284,20 @@ def _bbox_contains_signature_line(page, match_rect) -> bool:
     return False
 
 
-def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -> list[SignMatch]:
+def _filter_by_dominant_patterns(
+    matches: list[SignMatch],
+    signer_tokens: list[str] | None = None,
+    min_pages: int = 2,
+) -> list[SignMatch]:
     """Базовая директива: подписант один → паттерн места подписи единообразен по всему договору.
 
     Доминирующий паттерн = покрытие ≥ 50% от максимального покрытия среди всех паттернов
-    (и не менее min_pages). На каждой странице где есть матч доминирующего паттерна,
-    матчи остальных паттернов отбрасываются.
+    (и не менее min_pages).
+
+    На каждой странице где есть dominant, non-dominant матчи дропаются ЕСЛИ ИХ context
+    НЕ содержит токенов подписанта (ФИО). Это различает:
+    - "Руководитель службы заказчика ____" (форма, нет ФИО) → дроп
+    - "________________ (Лебедев А.П.)" (реальная подпись) → keep
     """
     if not matches:
         return matches
@@ -309,17 +317,35 @@ def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -
     if not dominant:
         return matches
 
-    # Страницы где сработал хотя бы один доминирующий паттерн
     pages_with_dominant: set = set()
     for m in matches:
         if m.pattern in dominant:
             pages_with_dominant.add(m.page)
 
+    # signer_tokens: ["Лебедев", "Алексей", "Петрович"] и т.п.
+    signer_lower = [t.lower() for t in (signer_tokens or []) if len(t) >= 3]
+
     filtered = []
     for m in matches:
-        if m.page in pages_with_dominant and m.pattern not in dominant:
+        if m.pattern in dominant:
+            filtered.append(m)
             continue
-        filtered.append(m)
+
+        if m.page not in pages_with_dominant:
+            filtered.append(m)
+            continue
+
+        # Non-dominant на странице с dominant → проверяем signer tokens в context
+        if signer_lower:
+            ctx_lower = m.context.lower()
+            has_signer = any(t in ctx_lower for t in signer_lower)
+            if has_signer:
+                filtered.append(m)  # реальная подпись — keep
+                continue
+
+        # Нет signer tokens → generic form field → дроп
+        continue
+
     return filtered
 
 
@@ -454,9 +480,16 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         pdf_doc.close()
 
     # Фильтр 8: доминирующий паттерн выигрывает.
-    # Если один паттерн = footer-шаблон документа (сработал на 2+ страницах),
-    # отбрасываем матчи "слабых" паттернов на тех же страницах.
-    raw_matches = _filter_by_dominant_patterns(raw_matches, min_pages=2)
+    # Извлекаем signer tokens для различения реальных подписей от формовых полей.
+    signer = party.get("signer", "")
+    signer_tokens = []
+    if signer:
+        for w in re.findall(r"[А-ЯA-ZЁ][а-яa-zА-ЯA-ZёЁ\-]{2,}", signer):
+            signer_tokens.append(w)
+        # Инициалы: "А.П." → "А.П."
+        for ini in re.findall(r"[А-ЯA-ZЁ]\.[А-ЯA-ZЁ]\.", signer):
+            signer_tokens.append(ini)
+    raw_matches = _filter_by_dominant_patterns(raw_matches, signer_tokens=signer_tokens, min_pages=2)
 
     return raw_matches
 
