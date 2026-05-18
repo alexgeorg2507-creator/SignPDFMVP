@@ -118,9 +118,6 @@ _SAME_LINE_TOLERANCE_PT = 4.0
 # Реальное место подписи: 1-2 строки текста ≈ 30-50pt.
 MAX_BBOX_HEIGHT_PT = 60.0
 
-# Радиус поиска линии подписи рядом с bbox матча по Y (≈ 2 строки).
-NEAR_LINE_DISTANCE_PT = 40.0
-
 # Дедупликация по строке: bbox-ы с центрами по Y ближе этого порога
 # и пересечением по X считаются одним местом подписи.
 SAME_ROW_Y_TOLERANCE_PT = 6.0
@@ -264,17 +261,15 @@ def _bbox_overlap_ratio(a, b) -> float:
     return inter / smaller if smaller > 0 else 0.0
 
 
-def _bbox_has_signature_line_nearby(page, match_rect, max_y_distance: float = NEAR_LINE_DISTANCE_PT) -> bool:
-    """Проверяет наличие линии подписи (___/....) внутри bbox или рядом.
+def _bbox_contains_signature_line(page, match_rect) -> bool:
+    """СТРОГИЙ критерий валидного места подписи: bbox матча геометрически
+    пересекается с линией подчёркиваний (___) или точек (....) на странице.
 
-    Универсальный критерий валидного места подписи:
-    синоним стороны + линия подписи в пределах ~2 строк по Y с пересечением по X.
+    Убивает ложные срабатывания на одиночных словах (М.П., названия сторон,
+    "Адреса и реквизиты") где bbox охватывает только текст без линии.
 
-    Returns True если:
-      - bbox матча содержит/пересекается с линией подчёркиваний;
-      - либо линия в пределах max_y_distance pt по Y и пересекается по X.
+    Returns True если хоть одна линия пересекается с match_rect.
     """
-    # Собираем все линии подписи на странице — подчёркивания и точки
     line_rects = list(page.search_for("___"))
     line_rects.extend(page.search_for("....."))
 
@@ -282,21 +277,10 @@ def _bbox_has_signature_line_nearby(page, match_rect, max_y_distance: float = NE
         return False
 
     for line in line_rects:
-        # 1. Линия пересекается с bbox матча
+        # Геометрическое пересечение прямоугольников
         if (line.y0 <= match_rect.y1 and line.y1 >= match_rect.y0 and
                 line.x0 <= match_rect.x1 and line.x1 >= match_rect.x0):
             return True
-        # 2. Линия рядом по Y и есть X-пересечение
-        if line.y1 < match_rect.y0:
-            y_dist = match_rect.y0 - line.y1
-        elif line.y0 > match_rect.y1:
-            y_dist = line.y0 - match_rect.y1
-        else:
-            y_dist = 0.0
-        if y_dist <= max_y_distance:
-            x_overlap = (line.x1 >= match_rect.x0 and line.x0 <= match_rect.x1)
-            if x_overlap:
-                return True
     return False
 
 
@@ -355,9 +339,10 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
                         if (rect.y1 - rect.y0) > MAX_BBOX_HEIGHT_PT:
                             continue
 
-                        # Фильтр 5: линия подписи должна быть внутри bbox или рядом.
-                        # Универсальный критерий: синоним стороны + линия рядом.
-                        if not _bbox_has_signature_line_nearby(page, rect):
+                        # Фильтр 5: bbox должен СОДЕРЖАТЬ линию подписи (___/....) геометрически.
+                        # Универсальный критерий: место подписи = слово-якорь + линия в bbox.
+                        # Убивает ложные срабатывания на одиночных словах без линии.
+                        if not _bbox_contains_signature_line(page, rect):
                             continue
 
                         counter += 1

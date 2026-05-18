@@ -235,33 +235,99 @@ def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
     return patterns
 
 
+def _extract_distinctive_tokens(s: str) -> list[str]:
+    """Извлекает distinctive токены из строки: имена в кавычках, фамилии.
+
+    Примеры:
+      "Общество с ограниченной ответственностью «Стэп интегратор»"
+        → ["Стэп интегратор", "Стэп", "интегратор"]
+      "Ткачев Сергей Леонидович" → ["Ткачев", "Сергей", "Леонидович"]
+      "ИСПОЛНИТЕЛЬ" → ["ИСПОЛНИТЕЛЬ"]
+      "не указан" → []
+    """
+    if not s:
+        return []
+    sl = s.lower().strip()
+    if sl in ("не указан", "не указана", "не указано", "—", "-", "n/a", "na", ""):
+        return []
+
+    tokens = []
+    # 1. Содержимое кавычек: «Стэп интегратор» / "Acme Inc"
+    for m in re.finditer(r'[«"\']([^»"\']+)[»"\']', s):
+        inner = m.group(1).strip()
+        if len(inner) >= 3:
+            tokens.append(inner)
+            for w in inner.split():
+                if len(w) >= 4:
+                    tokens.append(w)
+
+    # 2. Слова с заглавной (имена собственные, фамилии, ROLE-as-UPPER)
+    stop = {
+        "общество", "ограниченной", "ответственностью", "компания",
+        "корпорация", "генеральный", "директор", "лице", "именуем",
+        "именуемая", "именуемое", "именуемый", "далее", "стороны",
+        "стороне", "договор", "договору", "паспорт", "выдан", "адрес",
+    }
+    for w in re.findall(r"[А-ЯA-ZЁ][а-яa-zА-ЯA-ZёЁ\-]{3,}", s):
+        if w.lower() in stop:
+            continue
+        tokens.append(w)
+
+    # Дедуп с сохранением порядка
+    seen, result = set(), []
+    for t in tokens:
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            result.append(t)
+    return result
+
+
 def _run_step5(doc, our_side: dict, patterns: List[str]):
     """Шаг 5: поиск мест подписи через finder.py с кастомными паттернами."""
     from core.finder import find_signatures
 
-    # Собираем синонимы ЧУЖИХ сторон (для отсечения паттернов которые
-    # случайно цепляют другую сторону: "Заказчик___ Подрядчик___" и т.п.)
+    # Собираем distinctive синонимы ЧУЖИХ сторон (для отсечения паттернов
+    # которые случайно цепляют другую сторону).
     our_entity = (our_side.get("legal_entity") or "").strip()
-    our_roles = set(r.strip() for r in our_side.get("roles", []) if r)
+    our_roles = set(r.strip().lower() for r in our_side.get("roles", []) if r)
     our_signer = (our_side.get("signer") or "").strip()
-    other_aliases = []
+    our_signer_tokens = set(t.lower() for t in _extract_distinctive_tokens(our_signer))
+    our_entity_tokens = set(t.lower() for t in _extract_distinctive_tokens(our_entity))
+
+    other_aliases: list[str] = []
     for p in our_side.get("all_parties", []):
         if not isinstance(p, dict):
             continue
         le = (p.get("legal_entity") or "").strip()
         role = (p.get("role") or "").strip()
         signer = (p.get("signer") or "").strip()
+
         # пропускаем нашу сторону
         if le and le == our_entity:
             continue
-        if role and role not in our_roles:
+
+        # роль чужой стороны
+        if role and role.lower() not in our_roles:
             other_aliases.append(role)
-        if le and le != our_entity:
-            other_aliases.append(le)
-        if signer and signer != our_signer:
-            other_aliases.append(signer)
-    # дедуп, убираем слишком короткие
-    other_aliases = list({a for a in other_aliases if a and len(a) >= 3})
+        # distinctive токены юрлица
+        for t in _extract_distinctive_tokens(le):
+            if t.lower() not in our_entity_tokens:
+                other_aliases.append(t)
+        # distinctive токены подписанта
+        for t in _extract_distinctive_tokens(signer):
+            if t.lower() not in our_signer_tokens:
+                other_aliases.append(t)
+
+    # дедуп, выбрасываем слишком короткие
+    seen = set()
+    other_aliases_clean = []
+    for a in other_aliases:
+        al = a.lower().strip()
+        if len(al) >= 3 and al not in seen:
+            seen.add(al)
+            other_aliases_clean.append(a)
+    other_aliases = other_aliases_clean
 
     party_dict = {
         "name": our_side["legal_entity"] or "auto",
