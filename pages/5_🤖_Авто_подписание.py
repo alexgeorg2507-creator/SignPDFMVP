@@ -100,11 +100,16 @@ def _get_strategic_fragments(doc, markers_block: dict) -> str:
     return "\n\n".join(fragments)[:8000]
 
 
-def _call_llm_json(prompt: str, max_tokens: int = 1500) -> Optional[dict]:
-    """Вызвать LLM, распарсить JSON-ответ. Возвращает None при ошибке."""
+def _call_llm_json(prompt: str, max_tokens: int = 1500, capture_key: str | None = None) -> Optional[dict]:
+    """Вызвать LLM, распарсить JSON-ответ. Возвращает None при ошибке.
+    capture_key: если задан — сохраняет промпт и raw-ответ в session_state под ключами
+    debug_prompt_<key> и debug_raw_<key>.
+    """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error("ANTHROPIC_API_KEY не задан.")
         return None
+    if capture_key:
+        st.session_state[f"debug_prompt_{capture_key}"] = prompt
     client = Anthropic()
     try:
         resp = client.messages.create(
@@ -113,6 +118,8 @@ def _call_llm_json(prompt: str, max_tokens: int = 1500) -> Optional[dict]:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = (resp.content[0].text or "").strip()
+        if capture_key:
+            st.session_state[f"debug_raw_{capture_key}"] = raw
         raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
         raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
         m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -149,7 +156,7 @@ def _run_step3(doc, lang: str) -> Optional[dict]:
         markers=markers_block,
     )
 
-    result = _call_llm_json(prompt, max_tokens=1500)
+    result = _call_llm_json(prompt, max_tokens=1500, capture_key="step3")
     if result is None:
         st.error("❌ Шаг 3: LLM не ответил или вернул невалидный JSON.")
         return None
@@ -199,9 +206,10 @@ def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
         strategic_fragments=fragments,
     )
 
-    result = _call_llm_json(prompt, max_tokens=1500)
+    result = _call_llm_json(prompt, max_tokens=1500, capture_key="step4")
     if result is None:
         st.error("❌ Шаг 4: LLM не вернул паттерны.")
+        _show_step4_debug()
         return None
 
     raw_patterns = result.get("patterns", [])
@@ -221,6 +229,7 @@ def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
             "❌ Шаг 4: Не удалось сгенерировать паттерны. "
             "Используйте ручной режим."
         )
+        _show_step4_debug()
         return None
 
     return patterns
@@ -253,11 +262,27 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
     return matches
 
 
+def _show_step4_debug():
+    """Показывает debug-блок шага 4 (промпт + raw ответ LLM)."""
+    prompt = st.session_state.get("debug_prompt_step4", "")
+    raw = st.session_state.get("debug_raw_step4", "")
+    if prompt or raw:
+        with st.expander("🔍 Debug шаг 4 — промпт и ответ LLM", expanded=True):
+            if prompt:
+                st.markdown("**Промпт ушедший в LLM:**")
+                st.code(prompt, language="text")
+            if raw:
+                st.markdown("**Raw ответ LLM:**")
+                st.code(raw, language="text")
+
+
 def _reset_pipeline():
     """Сброс всего состояния пайплайна."""
     for k in [
         "auto_language", "auto_our_side", "auto_patterns",
         "auto_matches", "auto_active_ids", "auto_signed_pdf",
+        "debug_prompt_step3", "debug_raw_step3",
+        "debug_prompt_step4", "debug_raw_step4",
     ]:
         st.session_state.pop(k, None)
 
@@ -317,6 +342,21 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
             f"/ {our_side['signer']} "
             f"(уверенность: {our_side['confidence']:.0%})"
         )
+        # Debug шаг 3: синонимы из шапки
+        with st.expander("🔍 Debug шаг 3 — синонимы из шапки", expanded=False):
+            st.markdown(f"**Юрлицо:** `{our_side['legal_entity']}`")
+            roles_str = ", ".join(our_side["roles"]) if our_side.get("roles") else "—"
+            st.markdown(f"**Роли в договоре:** {roles_str}")
+            st.markdown(f"**Подписант:** `{our_side['signer']}`")
+            st.markdown(f"**Уверенность:** {our_side['confidence']:.0%} · причина: `{our_side.get('match_reason', '—')}`")
+            if our_side.get("evidence"):
+                st.caption(f"Подтверждение: «{our_side['evidence'][:300]}»")
+            if our_side.get("all_parties"):
+                st.markdown("**Все стороны найдены в договоре:**")
+                for p in our_side["all_parties"]:
+                    st.markdown(f"- `{p}`")
+            with st.expander("📋 Промпт шага 3", expanded=False):
+                st.code(st.session_state.get("debug_prompt_step3", "—"), language="text")
 
         # ШАГ 4: Паттерны
         st.write("⚙️ Шаг 4: Генерация regex-паттернов...")
@@ -326,6 +366,13 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
             st.stop()
         st.session_state["auto_patterns"] = patterns
         st.write(f"✅ Сгенерировано паттернов: **{len(patterns)}**")
+        # Debug шаг 4: паттерны и промпт
+        with st.expander("🔍 Debug шаг 4 — паттерны и промпт", expanded=False):
+            st.markdown("**Сгенерированные паттерны:**")
+            for i, p in enumerate(patterns, 1):
+                st.code(p, language="")
+            with st.expander("📋 Промпт шага 4", expanded=False):
+                st.code(st.session_state.get("debug_prompt_step4", "—"), language="text")
 
         # ШАГ 5: Поиск
         st.write("🔎 Шаг 5: Поиск мест подписи...")
@@ -336,6 +383,13 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
         st.session_state["auto_matches"] = matches
         st.session_state["auto_active_ids"] = {m.id for m in matches}
         st.write(f"✅ Найдено мест: **{len(matches)}**")
+        # Debug шаг 5: найденные места
+        with st.expander("🔍 Debug шаг 5 — найденные места подписи", expanded=False):
+            for m in matches:
+                st.markdown(
+                    f"- стр. **{m.page + 1}** · conf `{m.confidence:.2f}` · `{m.context[:100]}`"
+                )
+                st.caption(f"  паттерн: `{m.pattern}` · bbox: `{[round(x, 1) for x in m.bbox]}`")
 
         status.update(label="✅ Пайплайн завершён — выберите места и скачайте", state="complete")
 
@@ -440,6 +494,59 @@ if "auto_matches" in st.session_state:
         st.warning("Нет выбранных мест подписи.")
     else:
         st.caption(f"Будет подписано: {active_count} из {len(matches)} мест.")
+
+        # ── Экспорт debug JSON ────────────────────────────────────────────────
+        from datetime import timezone
+        debug_export = {
+            "version": "1.6",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "doc_info": {
+                "filename": st.session_state.get("auto_doc_name", ""),
+                "pages": len(doc.pages),
+                "language": lang,
+            },
+            "step3_party_detection": {
+                "legal_entity": our_side.get("legal_entity", ""),
+                "roles": our_side.get("roles", []),
+                "signer": our_side.get("signer", ""),
+                "confidence": our_side.get("confidence", 0),
+                "match_reason": our_side.get("match_reason", ""),
+                "evidence": our_side.get("evidence", ""),
+                "all_parties": our_side.get("all_parties", []),
+                "prompt": st.session_state.get("debug_prompt_step3", ""),
+                "raw_llm_response": st.session_state.get("debug_raw_step3", ""),
+            },
+            "step4_pattern_generation": {
+                "patterns": patterns,
+                "prompt": st.session_state.get("debug_prompt_step4", ""),
+                "raw_llm_response": st.session_state.get("debug_raw_step4", ""),
+            },
+            "step5_signature_search": {
+                "total_found": len(matches),
+                "active_selected": active_count,
+                "matches": [
+                    {
+                        "id": m.id,
+                        "page": m.page,
+                        "bbox": list(m.bbox),
+                        "pattern": m.pattern,
+                        "context": m.context,
+                        "confidence": m.confidence,
+                        "active": m.id in new_active_ids,
+                    }
+                    for m in matches
+                ],
+            },
+        }
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+        st.download_button(
+            "📥 Скачать debug JSON (для анализа)",
+            data=json.dumps(debug_export, ensure_ascii=False, indent=2),
+            file_name=f"signfinder_debug_{base}_{ts}.json",
+            mime="application/json",
+            key="dl_debug_json",
+        )
 
         if st.button("⬇ Скачать подписанный PDF", type="primary", disabled=(active_count == 0)):
             from core.overlay import apply_signature
