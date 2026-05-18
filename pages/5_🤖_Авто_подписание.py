@@ -206,7 +206,7 @@ def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
         strategic_fragments=fragments,
     )
 
-    result = _call_llm_json(prompt, max_tokens=1500, capture_key="step4")
+    result = _call_llm_json(prompt, max_tokens=3000, capture_key="step4")
     if result is None:
         st.error("❌ Шаг 4: LLM не вернул паттерны.")
         _show_step4_debug()
@@ -274,6 +274,56 @@ def _show_step4_debug():
             if raw:
                 st.markdown("**Raw ответ LLM:**")
                 st.code(raw, language="text")
+
+
+def _build_debug_export() -> dict:
+    """Собирает полный debug-трейс из session_state. Работает при любом результате pipeline."""
+    from datetime import timezone
+    doc = st.session_state.get("auto_doc")
+    our_side = st.session_state.get("auto_our_side") or {}
+    patterns = st.session_state.get("auto_patterns") or []
+    matches = st.session_state.get("auto_matches") or []
+
+    return {
+        "version": "1.6",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "doc_info": {
+            "filename": st.session_state.get("auto_doc_name", ""),
+            "pages": len(doc.pages) if doc else 0,
+            "language": st.session_state.get("auto_language", ""),
+        },
+        "step3_party_detection": {
+            "legal_entity": our_side.get("legal_entity", ""),
+            "roles": our_side.get("roles", []),
+            "signer": our_side.get("signer", ""),
+            "confidence": our_side.get("confidence", 0),
+            "match_reason": our_side.get("match_reason", ""),
+            "evidence": our_side.get("evidence", ""),
+            "all_parties": our_side.get("all_parties", []),
+            "prompt": st.session_state.get("debug_prompt_step3", ""),
+            "raw_llm_response": st.session_state.get("debug_raw_step3", ""),
+        },
+        "step4_pattern_generation": {
+            "patterns": patterns,
+            "prompt": st.session_state.get("debug_prompt_step4", ""),
+            "raw_llm_response": st.session_state.get("debug_raw_step4", ""),
+            "raw_length_chars": len(st.session_state.get("debug_raw_step4", "")),
+        },
+        "step5_signature_search": {
+            "total_found": len(matches),
+            "matches": [
+                {
+                    "id": m.id,
+                    "page": m.page,
+                    "bbox": list(m.bbox),
+                    "pattern": m.pattern,
+                    "context": m.context,
+                    "confidence": m.confidence,
+                }
+                for m in matches
+            ],
+        },
+    }
 
 
 def _reset_pipeline():
@@ -394,6 +444,26 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
         status.update(label="✅ Пайплайн завершён — выберите места и скачайте", state="complete")
 
 
+# ── Кнопка экспорта debug JSON — всегда доступна после запуска пайплайна ──────
+if any(st.session_state.get(k) for k in (
+    "debug_prompt_step3", "debug_prompt_step4", "auto_our_side", "auto_patterns"
+)):
+    st.divider()
+    col_exp, _ = st.columns([2, 4])
+    with col_exp:
+        export = _build_debug_export()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+        st.download_button(
+            "📥 Экспорт debug JSON (для анализа)",
+            data=json.dumps(export, ensure_ascii=False, indent=2),
+            file_name=f"signfinder_debug_{base}_{ts}.json",
+            mime="application/json",
+            key="dl_debug_always",
+            help="Полный трейс: промпты, raw LLM-ответы, паттерны, найденные места",
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Шаг 6: Превью с чекбоксами
 # ══════════════════════════════════════════════════════════════════════════════
@@ -494,59 +564,6 @@ if "auto_matches" in st.session_state:
         st.warning("Нет выбранных мест подписи.")
     else:
         st.caption(f"Будет подписано: {active_count} из {len(matches)} мест.")
-
-        # ── Экспорт debug JSON ────────────────────────────────────────────────
-        from datetime import timezone
-        debug_export = {
-            "version": "1.6",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "doc_info": {
-                "filename": st.session_state.get("auto_doc_name", ""),
-                "pages": len(doc.pages),
-                "language": lang,
-            },
-            "step3_party_detection": {
-                "legal_entity": our_side.get("legal_entity", ""),
-                "roles": our_side.get("roles", []),
-                "signer": our_side.get("signer", ""),
-                "confidence": our_side.get("confidence", 0),
-                "match_reason": our_side.get("match_reason", ""),
-                "evidence": our_side.get("evidence", ""),
-                "all_parties": our_side.get("all_parties", []),
-                "prompt": st.session_state.get("debug_prompt_step3", ""),
-                "raw_llm_response": st.session_state.get("debug_raw_step3", ""),
-            },
-            "step4_pattern_generation": {
-                "patterns": patterns,
-                "prompt": st.session_state.get("debug_prompt_step4", ""),
-                "raw_llm_response": st.session_state.get("debug_raw_step4", ""),
-            },
-            "step5_signature_search": {
-                "total_found": len(matches),
-                "active_selected": active_count,
-                "matches": [
-                    {
-                        "id": m.id,
-                        "page": m.page,
-                        "bbox": list(m.bbox),
-                        "pattern": m.pattern,
-                        "context": m.context,
-                        "confidence": m.confidence,
-                        "active": m.id in new_active_ids,
-                    }
-                    for m in matches
-                ],
-            },
-        }
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
-        st.download_button(
-            "📥 Скачать debug JSON (для анализа)",
-            data=json.dumps(debug_export, ensure_ascii=False, indent=2),
-            file_name=f"signfinder_debug_{base}_{ts}.json",
-            mime="application/json",
-            key="dl_debug_json",
-        )
 
         if st.button("⬇ Скачать подписанный PDF", type="primary", disabled=(active_count == 0)):
             from core.overlay import apply_signature
