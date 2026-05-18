@@ -228,9 +228,33 @@ def _find_signature_bbox(page, matched_text: str) -> list:
 
 # ── Поиск ────────────────────────────────────────────────────────────────────
 
+def _has_real_signature_line(text: str) -> bool:
+    """Матч содержит реальную линию подписи (подчёркивания или точки), не просто слово."""
+    return bool(re.search(r"_{3,}|\.{5,}", text))
+
+
+def _bbox_key(rect, precision: int = 4) -> tuple:
+    """Ключ для дедупликации — bbox с округлением."""
+    return (round(rect.x0, precision), round(rect.y0, precision),
+            round(rect.x1, precision), round(rect.y1, precision))
+
+
+def _bbox_overlap_ratio(a, b) -> float:
+    """Доля пересечения меньшего bbox с большим (0..1)."""
+    ix0 = max(a.x0, b.x0); iy0 = max(a.y0, b.y0)
+    ix1 = min(a.x1, b.x1); iy1 = min(a.y1, b.y1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area_a = (a.x1 - a.x0) * (a.y1 - a.y0)
+    area_b = (b.x1 - b.x0) * (b.y1 - b.y0)
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
 def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
     """Поиск мест подписи для заданной стороны."""
-    matches = []
+    raw_matches: list[SignMatch] = []
     counter = 0
 
     compiled = []
@@ -247,18 +271,32 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
             text = parsed_page.text
             page = pdf_doc[page_idx]
 
+            # Собираем сырые матчи со всех паттернов
+            page_raw: list[SignMatch] = []
+            seen_text_spans: set[tuple] = set()  # (start, end) → первый паттерн выиграл
+
             for pattern_str, regex in compiled:
                 for m in regex.finditer(text):
                     matched_text = m.group(0)
-                    rects = _find_signature_bbox(page, matched_text)
 
+                    # Фильтр 1: матч должен содержать реальную линию подписи
+                    if not _has_real_signature_line(matched_text):
+                        continue
+
+                    # Фильтр 2: одинаковые текстовые позиции — дубль паттернов
+                    span_key = (m.start(), m.end())
+                    if span_key in seen_text_spans:
+                        continue
+                    seen_text_spans.add(span_key)
+
+                    rects = _find_signature_bbox(page, matched_text)
                     for rect in rects:
                         counter += 1
                         start = max(0, m.start() - 40)
                         end = min(len(text), m.end() + 40)
                         ctx = text[start:end].replace("\n", " ").strip()
 
-                        matches.append(SignMatch(
+                        page_raw.append(SignMatch(
                             id=f"sig_{counter:03d}",
                             page=page_idx,
                             bbox=tuple(rect),
@@ -266,42 +304,23 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
                             party=party["name"],
                             pattern=pattern_str,
                         ))
+
+            # Фильтр 3: дедупликация по bbox-overlap на уровне страницы
+            # Если два bbox перекрываются >70% — оставляем первый (выше confidence)
+            deduped: list[SignMatch] = []
+            for candidate in page_raw:
+                c_rect = fitz.Rect(candidate.bbox)
+                is_dup = False
+                for kept in deduped:
+                    k_rect = fitz.Rect(kept.bbox)
+                    if _bbox_overlap_ratio(c_rect, k_rect) > 0.70:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    deduped.append(candidate)
+
+            raw_matches.extend(deduped)
     finally:
         pdf_doc.close()
 
-    return matches
-
-# ── LLM-fallback (v1.4.2) ────────────────────────────────────────────────────
-
-def find_signatures_smart(
-    doc: ParsedDocument,
-    party: dict,
-    min_expected: int = 1,
-    llm_fallback: bool = True,
-) -> tuple[list[SignMatch], str]:
-    """Умный поиск с LLM-fallback.
-
-    Параметры:
-        doc — ParsedDocument
-        party — party dict из parse_parties_json()
-        min_expected — минимум ожидаемых мест (если regex < min → LLM)
-        llm_fallback — включён ли LLM-fallback
-
-    Возвращает:
-        (matches, source) где source = "regex" | "llm_fallback"
-    """
-    # Сначала пробуем regex
-    matches = find_signatures(doc, party)
-
-    if len(matches) >= min_expected:
-        return matches, "regex"
-
-    # Regex не нашёл достаточно → LLM-fallback
-    if llm_fallback:
-        from core.llm_finder import find_signatures_llm
-        llm_matches = find_signatures_llm(doc, party["name"], doc.language)
-        if llm_matches:
-            return llm_matches, "llm_fallback"
-
-    # Fallback не помог или выключен — возвращаем что есть
-    return matches, "regex"
+    return raw_matches
