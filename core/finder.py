@@ -284,6 +284,44 @@ def _bbox_contains_signature_line(page, match_rect) -> bool:
     return False
 
 
+def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -> list[SignMatch]:
+    """Базовая директива: подписант один → паттерн места подписи единообразен по всему договору.
+
+    Если паттерн сработал на ≥min_pages страницах — это "доминирующий" footer-шаблон.
+    На каждой странице где есть матч доминирующего паттерна, матчи остальных паттернов
+    отбрасываются (они скорее всего ложные срабатывания на слова "Заказчик"/"Подрядчик"
+    в теле текста, формах, приложениях).
+
+    Если доминирующих паттернов нет — возвращаем как есть (документ короткий или
+    места подписи на разных страницах разные).
+    """
+    if not matches:
+        return matches
+
+    from collections import defaultdict
+    pattern_pages: dict[str, set] = defaultdict(set)
+    for m in matches:
+        pattern_pages[m.pattern].add(m.page)
+
+    dominant = {p for p, pages in pattern_pages.items() if len(pages) >= min_pages}
+    if not dominant:
+        return matches
+
+    # Страницы где сработал хотя бы один доминирующий паттерн
+    pages_with_dominant: set = set()
+    for m in matches:
+        if m.pattern in dominant:
+            pages_with_dominant.add(m.page)
+
+    filtered = []
+    for m in matches:
+        # На странице есть доминирующий, а это другой паттерн — дроп
+        if m.page in pages_with_dominant and m.pattern not in dominant:
+            continue
+        filtered.append(m)
+    return filtered
+
+
 def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
     """Поиск мест подписи для заданной стороны."""
     raw_matches: list[SignMatch] = []
@@ -400,6 +438,11 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
             raw_matches.extend(row_deduped)
     finally:
         pdf_doc.close()
+
+    # Фильтр 8: доминирующий паттерн выигрывает.
+    # Если один паттерн = footer-шаблон документа (сработал на 2+ страницах),
+    # отбрасываем матчи "слабых" паттернов на тех же страницах.
+    raw_matches = _filter_by_dominant_patterns(raw_matches, min_pages=2)
 
     return raw_matches
 
