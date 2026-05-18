@@ -330,6 +330,12 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
     compiled = []
     for pat in party.get("patterns", []):
         try:
+            # Фильтр 0: отсекаем "реверсные" паттерны — начинаются с линии подписи
+            # (_{3,}...Наше_имя). Такой паттерн садится bbox-ом на ЧУЖУЮ линию подписи
+            # и тянет до нашего имени → ложное срабатывание.
+            pat_stripped = re.sub(r'^\(\?:', '', pat)  # убираем (?:
+            if pat_stripped.startswith('_') or pat_stripped.startswith('\\.') or pat_stripped.startswith('.'):
+                continue
             compiled.append((pat, re.compile(pat, re.IGNORECASE | re.UNICODE)))
         except re.error:
             continue
