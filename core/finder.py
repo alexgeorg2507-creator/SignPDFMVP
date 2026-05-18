@@ -324,3 +324,36 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         pdf_doc.close()
 
     return raw_matches
+
+def find_signatures_smart(
+    doc: ParsedDocument,
+    party: dict,
+    min_expected: int = 1,
+    llm_fallback: bool = False,
+) -> tuple[list[SignMatch], str]:
+    """find_signatures + source label для совместимости с app.py.
+
+    Returns:
+        (matches, source) где source ∈ {"regex", "llm_fallback"}
+    """
+    matches = find_signatures(doc, party)
+
+    if matches or not llm_fallback:
+        return matches, "regex"
+
+    # LLM-fallback: если regex не нашёл — пробуем сгенерировать паттерны на лету
+    try:
+        from core.pattern_extractor import extract_patterns
+        result = extract_patterns(doc, party["name"], getattr(doc, "language", "ru"))
+        if result.get("patterns"):
+            fallback_party = dict(party)
+            existing = fallback_party.get("patterns", [])
+            fallback_party["patterns"] = list(dict.fromkeys(
+                existing + result["patterns"]
+            ))
+            matches = find_signatures(doc, fallback_party)
+            return matches, "llm_fallback"
+    except Exception as e:
+        print(f"[finder] llm_fallback error: {e}")
+
+    return [], "regex"
