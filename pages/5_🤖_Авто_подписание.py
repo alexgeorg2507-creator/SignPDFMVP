@@ -239,6 +239,30 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
     """Шаг 5: поиск мест подписи через finder.py с кастомными паттернами."""
     from core.finder import find_signatures
 
+    # Собираем синонимы ЧУЖИХ сторон (для отсечения паттернов которые
+    # случайно цепляют другую сторону: "Заказчик___ Подрядчик___" и т.п.)
+    our_entity = (our_side.get("legal_entity") or "").strip()
+    our_roles = set(r.strip() for r in our_side.get("roles", []) if r)
+    our_signer = (our_side.get("signer") or "").strip()
+    other_aliases = []
+    for p in our_side.get("all_parties", []):
+        if not isinstance(p, dict):
+            continue
+        le = (p.get("legal_entity") or "").strip()
+        role = (p.get("role") or "").strip()
+        signer = (p.get("signer") or "").strip()
+        # пропускаем нашу сторону
+        if le and le == our_entity:
+            continue
+        if role and role not in our_roles:
+            other_aliases.append(role)
+        if le and le != our_entity:
+            other_aliases.append(le)
+        if signer and signer != our_signer:
+            other_aliases.append(signer)
+    # дедуп, убираем слишком короткие
+    other_aliases = list({a for a in other_aliases if a and len(a) >= 3})
+
     party_dict = {
         "name": our_side["legal_entity"] or "auto",
         "display": our_side["legal_entity"] or "auto",
@@ -247,6 +271,7 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
             + our_side.get("roles", [])
             + [our_side["signer"]]
         ),
+        "other_aliases": other_aliases,
         "patterns": patterns,
         "notes": "",
     }

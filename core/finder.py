@@ -121,6 +121,10 @@ MAX_BBOX_HEIGHT_PT = 60.0
 # Радиус поиска линии подписи рядом с bbox матча по Y (≈ 2 строки).
 NEAR_LINE_DISTANCE_PT = 40.0
 
+# Дедупликация по строке: bbox-ы с центрами по Y ближе этого порога
+# и пересечением по X считаются одним местом подписи.
+SAME_ROW_Y_TOLERANCE_PT = 6.0
+
 
 def _extract_anchor_words(matched_text: str) -> list[str]:
     """Извлекает значимые слова (без подчёркиваний и пунктуации) из match-текста."""
@@ -308,6 +312,12 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         except re.error:
             continue
 
+    # Чужие алиасы — паттерны не должны цеплять обе стороны одновременно.
+    # Универсальный признак: matched_text содержит и нашу, и чужую сторону → дроп.
+    other_aliases: list[str] = [
+        a.strip() for a in party.get("other_aliases", []) if a and len(a.strip()) >= 3
+    ]
+
     pdf_doc = fitz.open(stream=doc.pdf_bytes, filetype="pdf")
 
     try:
@@ -332,6 +342,11 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
                     if span_key in seen_text_spans:
                         continue
                     seen_text_spans.add(span_key)
+
+                    # Фильтр 3: чужая сторона в matched_text — паттерн ловит не нас
+                    if other_aliases:
+                        if any(alias.lower() in matched_text.lower() for alias in other_aliases):
+                            continue
 
                     rects = _find_signature_bbox(page, matched_text)
                     for rect in rects:
@@ -359,8 +374,8 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
                             pattern=pattern_str,
                         ))
 
-            # Фильтр 3: дедупликация по bbox-overlap на уровне страницы
-            # Если два bbox перекрываются >70% — оставляем первый (выше confidence)
+            # Фильтр 6: дедупликация по bbox-overlap (>70%).
+            # Для близких bbox с любым уровнем overlap.
             deduped: list[SignMatch] = []
             for candidate in page_raw:
                 c_rect = fitz.Rect(candidate.bbox)
@@ -373,7 +388,31 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
                 if not is_dup:
                     deduped.append(candidate)
 
-            raw_matches.extend(deduped)
+            # Фильтр 7: дедупликация по строке.
+            # bbox-ы с близкими Y-центрами + любое X-пересечение = одна строка подписи.
+            # Оставляем самый компактный (минимальная площадь).
+            def _area(b):
+                return (b[2] - b[0]) * (b[3] - b[1])
+
+            def _y_center(b):
+                return (b[1] + b[3]) / 2
+
+            def _x_overlap(a, b):
+                return min(a[2], b[2]) > max(a[0], b[0])
+
+            row_deduped: list[SignMatch] = []
+            for candidate in sorted(deduped, key=lambda m: _area(m.bbox)):
+                c_yc = _y_center(candidate.bbox)
+                is_dup = False
+                for kept in row_deduped:
+                    if (abs(c_yc - _y_center(kept.bbox)) <= SAME_ROW_Y_TOLERANCE_PT and
+                            _x_overlap(candidate.bbox, kept.bbox)):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    row_deduped.append(candidate)
+
+            raw_matches.extend(row_deduped)
     finally:
         pdf_doc.close()
 
