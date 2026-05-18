@@ -331,11 +331,18 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
     compiled = []
     for pat in party.get("patterns", []):
         try:
-            # Фильтр 0: отсекаем "реверсные" паттерны — начинаются с линии подписи
-            # (_{3,}...Наше_имя). Такой паттерн садится bbox-ом на ЧУЖУЮ линию подписи
-            # и тянет до нашего имени → ложное срабатывание.
+            # Фильтр 0: отсекаем "реверсные многострочные" паттерны.
+            # Паттерн начинается с линии подписи (_{3,}, \.{5,}) И содержит
+            # многострочный wildcard [\s\S] → садится bbox-ом на ЧУЖУЮ линию
+            # и тянет через N строк до нашего имени.
+            # Однострочные реверсные (_{3,}\s*\(Лебедев А.П.\)) — БЕЗОПАСНЫ,
+            # это наша линия + наше имя рядом.
             pat_stripped = re.sub(r'^\(\?:', '', pat)  # убираем (?:
-            if pat_stripped.startswith('_') or pat_stripped.startswith('\\.') or pat_stripped.startswith('.'):
+            is_reverse = (pat_stripped.startswith('_') or
+                          pat_stripped.startswith('\\.') or
+                          pat_stripped.startswith('.'))
+            has_multiline = '\\s\\S' in pat or '\\S\\s' in pat
+            if is_reverse and has_multiline:
                 continue
             compiled.append((pat, re.compile(pat, re.IGNORECASE | re.UNICODE)))
         except re.error:
