@@ -99,7 +99,7 @@ with col_btn:
     st.write("")
     try:
         if st.button("⚙ Изменить данные"):
-            st.switch_page("4____Настройки.py")
+            st.switch_page("4_⚙️_Настройки.py")
     except AttributeError:
         st.info("Раздел: Настройки")
 
@@ -132,7 +132,7 @@ with card_col2:
 """)
     try:
         if st.button("→ Открыть", key="go_settings", use_container_width=True):
-            st.switch_page("4____Настройки.py")
+            st.switch_page("4_⚙️_Настройки")
     except AttributeError:
         st.markdown("[→ Настройки](/4____Настройки)")
 
