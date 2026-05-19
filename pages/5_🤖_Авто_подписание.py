@@ -640,76 +640,78 @@ with nav4:
         st.session_state["current_page"] = current_page + 1
         st.rerun()
 
-# Canvas
-_canvas_ok = False
+# Превью страницы с подсветкой якорей
+_preview_rendered = False
 try:
-    from streamlit_drawable_canvas import st_canvas
-    _canvas_ok = True
-except ImportError:
-    pass
+    from core.preview import render_page_with_highlights
+    from core.finder import SignMatch as _SM
 
-if _canvas_ok:
-    import fitz as _fitz
-    _fitz_doc = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
-    try:
-        page_img = _render_page_pil(_fitz_doc, current_page, CANVAS_SCALE)
-        img_w, img_h = page_img.size
-        display_w = min(img_w, 900)
-        display_h = int(img_h * display_w / img_w)
+    pm = []
+    for a in page_anchors:
+        pi = _get_anchor_page_idx(a, total_pages) or current_page
+        if pi == current_page:
+            pm.append(_SM(
+                id=a.id, page=pi, bbox=a.bbox, context=a.anchor_text,
+                party="", pattern=a.generated_pattern,
+                operator_excluded=not st.session_state.get(f"anchor_enabled_{a.id}", True),
+            ))
 
-        canvas_objects = [_anchor_to_canvas_obj(a, CANVAS_SCALE, total_pages) for a in page_anchors]
+    img_bytes = render_page_with_highlights(doc.pdf_bytes, current_page, pm, scale=1.5)
 
-        result = st_canvas(
-            fill_color="rgba(0,150,0,0.25)",
-            stroke_width=2,
-            stroke_color="#009900",
-            background_image=page_img,
-            update_streamlit=True,
-            width=display_w,
-            height=display_h,
-            drawing_mode="transform" if mode_key == "view" else "rect",
-            initial_drawing={"version": "4.4.0", "objects": canvas_objects},
-            key=f"canvas_{current_page}_{mode_key}_{len(page_anchors)}",
+    if mode_key == "add":
+        # Кликабельное превью — клик добавляет якорь
+        from streamlit_image_coordinates import streamlit_image_coordinates
+        from PIL import Image
+
+        pil_img = Image.open(io.BytesIO(img_bytes))
+        img_w, img_h = pil_img.size
+        click_scale = 1.5  # scale при рендере превью
+
+        coords = streamlit_image_coordinates(
+            pil_img,
+            key=f"click_{current_page}_{len(page_anchors)}",
         )
 
-        if result.json_data is not None:
-            new_objs = result.json_data.get("objects", [])
-            if _handle_canvas_changes(new_objs, page_anchors, current_page, CANVAS_SCALE, _fitz_doc):
-                st.rerun()
-    except Exception as e:
-        st.warning(f"Canvas ошибка: {e}")
-        _canvas_ok = False
-    finally:
-        _fitz_doc.close()
+        if coords is not None:
+            click_x_pt = coords["x"] / click_scale
+            click_y_pt = coords["y"] / click_scale
 
-if not _canvas_ok:
-    st.info("streamlit-drawable-canvas не установлен — drag&drop недоступен. "
-            "Добавляйте якоря вручную через координаты.")
-    try:
-        from core.preview import render_page_with_highlights
-        from core.finder import SignMatch as _SM
-        pm = []
-        for a in page_anchors:
-            pi = _get_anchor_page_idx(a, total_pages) or current_page
-            if pi == current_page:
-                pm.append(_SM(
-                    id=a.id, page=pi, bbox=a.bbox, context=a.anchor_text,
-                    party="", pattern=a.generated_pattern,
-                    operator_excluded=not st.session_state.get(f"anchor_enabled_{a.id}", True),
-                ))
-        img_b = render_page_with_highlights(doc.pdf_bytes, current_page, pm, scale=1.5)
-        st.image(img_b, use_container_width=True)
-    except Exception as e:
-        st.warning(f"Превью недоступно: {e}")
+            # Проверка: не обработали ли мы этот клик уже
+            last_click = st.session_state.get("_last_click")
+            this_click = (current_page, round(click_x_pt, 1), round(click_y_pt, 1))
+            if last_click != this_click:
+                st.session_state["_last_click"] = this_click
+                try:
+                    import fitz as _fitz
+                    from core.anchor_builder import build_anchor_from_click
+                    _fd = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+                    new_a = build_anchor_from_click(
+                        _fd, current_page, click_x_pt, click_y_pt,
+                        st.session_state.get("auto_language", "ru"),
+                    )
+                    _fd.close()
+                    if new_a:
+                        st.session_state["all_anchors"].append(new_a)
+                        st.rerun()
+                    else:
+                        st.warning("Нет текста в этой точке. Кликните ближе к тексту или подчёркиваниям.")
+                except Exception as e:
+                    st.error(f"Ошибка добавления: {e}")
+    else:
+        # Режим просмотра — статичное превью
+        st.image(img_bytes, use_container_width=True)
 
-# Ручное добавление (fallback)
-if mode_key == "add" and not _canvas_ok:
-    st.markdown("**Добавить якорь по координатам (pt):**")
+    _preview_rendered = True
+except Exception as e:
+    st.warning(f"Превью недоступно: {e}")
+
+if mode_key == "add" and not _preview_rendered:
+    st.caption("Превью недоступно — ручной ввод координат:")
     mx_col, my_col, madd_col = st.columns([2, 2, 1])
     with mx_col:
-        mx = st.number_input("X", min_value=0.0, value=100.0, key="man_x")
+        mx = st.number_input("X (pt)", min_value=0.0, value=100.0, key="man_x")
     with my_col:
-        my = st.number_input("Y", min_value=0.0, value=200.0, key="man_y")
+        my = st.number_input("Y (pt)", min_value=0.0, value=200.0, key="man_y")
     with madd_col:
         st.write(""); st.write("")
         if st.button("➕", key="btn_add_manual"):
@@ -722,7 +724,6 @@ if mode_key == "add" and not _canvas_ok:
                 _fd.close()
                 if a:
                     st.session_state["all_anchors"].append(a)
-                    st.success(f"Добавлен: «{a.anchor_text[:40]}»")
                     st.rerun()
                 else:
                     st.warning("Нет текста в этой точке.")

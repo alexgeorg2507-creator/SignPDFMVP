@@ -139,28 +139,12 @@ st.divider()
 # ── Документация ──────────────────────────────────────────────────────────────
 st.subheader("📖 Документация")
 
-docs = {
-    "concept_v1_3": "📄 Концепция проекта v1.3",
-    "tz_v1_7": "📄 Техническое задание v1.7",
-}
-
-doc_col1, doc_col2 = st.columns(2)
-
-with doc_col1:
-    try:
-        if st.button(docs["concept_v1_3"], use_container_width=True):
-            st.session_state["selected_doc"] = "concept_v1_3"
-            st.switch_page("pages/6___Документация.py")
-    except AttributeError:
-        st.markdown(f"[{docs['concept_v1_3']}](/6___Документация)")
-
-with doc_col2:
-    try:
-        if st.button(docs["tz_v1_7"], use_container_width=True):
-            st.session_state["selected_doc"] = "tz_v1_7"
-            st.switch_page("pages/6___Документация.py")
-    except AttributeError:
-        st.markdown(f"[{docs['tz_v1_7']}](/6___Документация)")
+try:
+    if st.button("📄 Концепция проекта v1.3", use_container_width=False):
+        st.session_state["selected_doc"] = "concept_v1_3"
+        st.switch_page("pages/6_📖_Документация.py")
+except (AttributeError, Exception):
+    st.markdown("[📄 Концепция проекта v1.3](/Документация)")
 
 st.divider()
 st.caption("SignFinder MVP v1.7")

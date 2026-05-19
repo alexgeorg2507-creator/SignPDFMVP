@@ -19,11 +19,6 @@ AVAILABLE_DOCS = {
         "filename": "SignFinder_Concept_v1_3.md",
         "description": "Архитектура, методы парсинга, светофор, текстовые якоря",
     },
-    "tz_v1_7": {
-        "title": "Техническое задание v1.7",
-        "filename": "TZ_SignFinder_MVP_v1_7.md",
-        "description": "Текущая версия ТЗ",
-    },
 }
 
 default_doc = st.session_state.pop("selected_doc", "concept_v1_3")
