@@ -11,7 +11,7 @@ if not st.session_state.get("auth", False):
 
 st.title("📖 Документация SignFinder")
 
-DOCS_DIR = Path(__file__).parent / "docs"
+DOCS_DIR = Path(__file__).parent.parent / "docs"
 
 AVAILABLE_DOCS = {
     "concept_v1_3": {

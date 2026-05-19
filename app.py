@@ -99,7 +99,7 @@ with col_btn:
     st.write("")
     try:
         if st.button("⚙ Изменить данные"):
-            st.switch_page("4_⚙️_Настройки.py")
+            st.switch_page("pages/4_⚙️_Настройки.py")
     except AttributeError:
         st.info("Раздел: Настройки")
 
@@ -119,7 +119,7 @@ with card_col1:
 """)
     try:
         if st.button("→ Открыть", key="go_auto", type="primary", use_container_width=True):
-            st.switch_page("5___Авто_подписание.py")
+            st.switch_page("pages/5_🤖_Авто_подписание.py")
     except AttributeError:
         st.markdown("[→ Авто-подписание](/5___Авто_подписание)")
 
@@ -132,7 +132,7 @@ with card_col2:
 """)
     try:
         if st.button("→ Открыть", key="go_settings", use_container_width=True):
-            st.switch_page("4_⚙️_Настройки")
+            st.switch_page("pages/4_⚙️_Настройки.py")
     except AttributeError:
         st.markdown("[→ Настройки](/4____Настройки)")
 
@@ -152,7 +152,7 @@ with doc_col1:
     try:
         if st.button(docs["concept_v1_3"], use_container_width=True):
             st.session_state["selected_doc"] = "concept_v1_3"
-            st.switch_page("6___Документация.py")
+            st.switch_page("pages/6___Документация.py")
     except AttributeError:
         st.markdown(f"[{docs['concept_v1_3']}](/6___Документация)")
 
@@ -160,7 +160,7 @@ with doc_col2:
     try:
         if st.button(docs["tz_v1_7"], use_container_width=True):
             st.session_state["selected_doc"] = "tz_v1_7"
-            st.switch_page("6___Документация.py")
+            st.switch_page("pages/6___Документация.py")
     except AttributeError:
         st.markdown(f"[{docs['tz_v1_7']}](/6___Документация)")
 
