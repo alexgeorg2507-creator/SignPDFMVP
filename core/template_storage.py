@@ -1,140 +1,213 @@
-"""Хранение и управление шаблонами документов (DocumentTemplate).
+"""CRUD для DocumentTemplate в GCS/local.
 
-v1.4.3
-
-Шаблон = набор координат мест подписи + fingerprint для автоматчинга.
-Хранится в GCS (прод) или локально (dev) как JSON-файлы.
-Путь: gs://signfinder-config/templates/{template_id}.json
+Хранилище: gs://signfinder-config/templates/{template_id}.json
+Локально: config/templates/{template_id}.json
+Бэкапы: config/templates/_archive/
 """
 import json
+import logging
 import os
-import uuid
-from datetime import datetime
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+from uuid import uuid4
 
-LOCAL_TEMPLATES_DIR = Path(__file__).parent.parent / "config" / "templates"
+logger = logging.getLogger(__name__)
+
+_TEMPLATES_PREFIX = "templates"
+_ARCHIVE_PREFIX = "templates/_archive"
 
 
-def _is_gcs_mode() -> bool:
+@dataclass
+class DocumentTemplate:
+    template_id: str
+    name: str
+    language: str
+    created_at: str
+    created_by: str                  # "pipeline_auto_1" | "manual_enrichment"
+
+    fingerprint: dict
+    anchors: list                    # list[dict] — сериализованные TextAnchor
+    synonyms_used: dict              # legal_entity, roles, signer
+
+    usage_stats: dict = field(default_factory=lambda: {
+        "times_applied": 0,
+        "times_confirmed": 0,
+        "times_rejected": 0,
+        "last_used": None,
+    })
+
+
+# ── Storage helpers ────────────────────────────────────────────────────────────
+
+def _is_gcs() -> bool:
     return bool(os.environ.get("GCS_BUCKET"))
 
 
-def _gcs_client():
-    from google.cloud import storage
-    return storage.Client()
+def _local_templates_dir() -> Path:
+    from core.storage import LOCAL_CONFIG_DIR
+    p = LOCAL_CONFIG_DIR / _TEMPLATES_PREFIX
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def _templates_prefix() -> str:
-    """Префикс пути для шаблонов в GCS."""
-    return "templates/"
+def _local_archive_dir() -> Path:
+    from core.storage import LOCAL_CONFIG_DIR
+    p = LOCAL_CONFIG_DIR / "_archive" / _TEMPLATES_PREFIX
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-# ── CRUD ─────────────────────────────────────────────────────────────────────
+def _blob_path(template_id: str) -> str:
+    return f"{_TEMPLATES_PREFIX}/{template_id}.json"
 
-def list_templates() -> list[dict]:
-    """Список всех шаблонов (метаданные: id, name, language, created_at).
-    
-    Возвращает: [{template_id, name, language, page_count, created_at}, ...]
-    """
-    if _is_gcs_mode():
-        bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
-        prefix = _templates_prefix()
-        blobs = bucket.list_blobs(prefix=prefix)
-        
-        templates = []
-        for blob in blobs:
-            if blob.name.endswith(".json"):
-                try:
-                    content = blob.download_as_text()
-                    data = json.loads(content)
-                    templates.append({
-                        "template_id": data.get("template_id"),
-                        "name": data.get("name"),
-                        "language": data.get("language"),
-                        "page_count": data.get("fingerprint", {}).get("page_count"),
-                        "created_at": data.get("created_at"),
-                    })
-                except Exception:
+
+def _archive_blob_path(template_id: str) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{_ARCHIVE_PREFIX}/{template_id}_{ts}.json"
+
+
+# ── Публичный API ──────────────────────────────────────────────────────────────
+
+def save_template(template: DocumentTemplate) -> str:
+    """Сохраняет шаблон в GCS/local. Возвращает template_id."""
+    content = json.dumps(asdict(template), ensure_ascii=False, indent=2)
+    try:
+        if _is_gcs():
+            from core.storage import _gcs_client
+            bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
+            bucket.blob(_blob_path(template.template_id)).upload_from_string(
+                content, content_type="application/json"
+            )
+        else:
+            path = _local_templates_dir() / f"{template.template_id}.json"
+            path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        logger.error("save_template failed: %s", e)
+        sys.stderr.write(f"[template_storage] save_template: {e}\n")
+        raise
+    return template.template_id
+
+
+def load_template(template_id: str) -> Optional[DocumentTemplate]:
+    """Читает шаблон по ID. None если не найден."""
+    try:
+        if _is_gcs():
+            from core.storage import _gcs_client
+            bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
+            blob = bucket.blob(_blob_path(template_id))
+            if not blob.exists():
+                return None
+            data = json.loads(blob.download_as_text())
+        else:
+            path = _local_templates_dir() / f"{template_id}.json"
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+        return DocumentTemplate(**data)
+    except Exception as e:
+        logger.error("load_template %s failed: %s", template_id, e)
+        sys.stderr.write(f"[template_storage] load_template {template_id}: {e}\n")
+        return None
+
+
+def list_templates(language: Optional[str] = None) -> list[DocumentTemplate]:
+    """Список всех шаблонов. Опционально с фильтром по языку."""
+    templates = []
+    try:
+        if _is_gcs():
+            from core.storage import _gcs_client
+            bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
+            blobs = bucket.list_blobs(prefix=f"{_TEMPLATES_PREFIX}/")
+            for blob in blobs:
+                if not blob.name.endswith(".json"):
                     continue
-        return templates
-    else:
-        LOCAL_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-        templates = []
-        for path in LOCAL_TEMPLATES_DIR.glob("*.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                templates.append({
-                    "template_id": data.get("template_id"),
-                    "name": data.get("name"),
-                    "language": data.get("language"),
-                    "page_count": data.get("fingerprint", {}).get("page_count"),
-                    "created_at": data.get("created_at"),
-                })
-            except Exception:
-                continue
-        return templates
-
-
-def read_template(template_id: str) -> dict | None:
-    """Загрузить шаблон по ID. Возвращает None если не найден."""
-    if _is_gcs_mode():
-        bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
-        blob = bucket.blob(f"{_templates_prefix()}{template_id}.json")
-        if not blob.exists():
-            return None
-        try:
-            return json.loads(blob.download_as_text())
-        except Exception:
-            return None
-    else:
-        path = LOCAL_TEMPLATES_DIR / f"{template_id}.json"
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-
-def write_template(template: dict) -> str:
-    """Сохранить шаблон. Возвращает template_id.
-    
-    Если template_id отсутствует — генерируется новый UUID.
-    Если уже существует — перезаписывается (без версионирования в v1.4.3).
-    """
-    if "template_id" not in template or not template["template_id"]:
-        template["template_id"] = str(uuid.uuid4())
-    
-    if "created_at" not in template:
-        template["created_at"] = datetime.now().isoformat()
-    
-    template_id = template["template_id"]
-    content = json.dumps(template, ensure_ascii=False, indent=2)
-    
-    if _is_gcs_mode():
-        bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
-        blob = bucket.blob(f"{_templates_prefix()}{template_id}.json")
-        blob.upload_from_string(content, content_type="application/json")
-    else:
-        LOCAL_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-        path = LOCAL_TEMPLATES_DIR / f"{template_id}.json"
-        path.write_text(content, encoding="utf-8")
-    
-    return template_id
+                if "/_archive/" in blob.name:
+                    continue
+                try:
+                    data = json.loads(blob.download_as_text())
+                    t = DocumentTemplate(**data)
+                    if language is None or t.language == language:
+                        templates.append(t)
+                except Exception as e:
+                    sys.stderr.write(f"[template_storage] list skip {blob.name}: {e}\n")
+        else:
+            for path in _local_templates_dir().glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    t = DocumentTemplate(**data)
+                    if language is None or t.language == language:
+                        templates.append(t)
+                except Exception as e:
+                    sys.stderr.write(f"[template_storage] list skip {path.name}: {e}\n")
+    except Exception as e:
+        logger.error("list_templates failed: %s", e)
+        sys.stderr.write(f"[template_storage] list_templates: {e}\n")
+    return templates
 
 
 def delete_template(template_id: str) -> bool:
-    """Удалить шаблон. Возвращает True если удалён, False если не найден."""
-    if _is_gcs_mode():
-        bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
-        blob = bucket.blob(f"{_templates_prefix()}{template_id}.json")
-        if not blob.exists():
-            return False
-        blob.delete()
+    """Удаляет шаблон. Бэкап в _archive/ перед удалением."""
+    try:
+        if _is_gcs():
+            from core.storage import _gcs_client
+            bucket = _gcs_client().bucket(os.environ["GCS_BUCKET"])
+            blob = bucket.blob(_blob_path(template_id))
+            if not blob.exists():
+                return False
+            # бэкап
+            content = blob.download_as_text()
+            bucket.blob(_archive_blob_path(template_id)).upload_from_string(
+                content, content_type="application/json"
+            )
+            blob.delete()
+        else:
+            path = _local_templates_dir() / f"{template_id}.json"
+            if not path.exists():
+                return False
+            archive_path = _local_archive_dir() / f"{template_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            archive_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            path.unlink()
         return True
-    else:
-        path = LOCAL_TEMPLATES_DIR / f"{template_id}.json"
-        if not path.exists():
-            return False
-        path.unlink()
-        return True
+    except Exception as e:
+        logger.error("delete_template %s failed: %s", template_id, e)
+        sys.stderr.write(f"[template_storage] delete_template {template_id}: {e}\n")
+        return False
+
+
+def generate_template_name(language: str, synonyms: Optional[dict] = None) -> str:
+    """
+    Имя по схеме: pipelineAuto1_YYYY-MM-DD_HHMM_<lang>[_<тип>]
+    synonyms может содержать ключ 'doc_type' для суффикса.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+    name = f"pipelineAuto1_{ts}_{language}"
+    if synonyms:
+        doc_type = synonyms.get("doc_type") or synonyms.get("legal_entity", "")
+        if doc_type:
+            safe = str(doc_type)[:20].replace(" ", "_")
+            name = f"{name}_{safe}"
+    return name
+
+
+def new_template(
+    language: str,
+    anchors: list,
+    fingerprint: dict,
+    synonyms_used: Optional[dict] = None,
+    created_by: str = "pipeline_auto_1",
+) -> DocumentTemplate:
+    """Фабрика — создаёт новый DocumentTemplate с uuid и текущим timestamp."""
+    synonyms_used = synonyms_used or {}
+    return DocumentTemplate(
+        template_id=uuid4().hex,
+        name=generate_template_name(language, synonyms_used),
+        language=language,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        created_by=created_by,
+        fingerprint=fingerprint,
+        anchors=anchors,
+        synonyms_used=synonyms_used,
+    )

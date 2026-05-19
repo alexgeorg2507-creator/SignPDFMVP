@@ -11,6 +11,7 @@ v1.3:
     bbox охватывает и слово, и реальную линию подписи)
 """
 import re
+import sys
 from dataclasses import dataclass
 
 import fitz
@@ -284,20 +285,12 @@ def _bbox_contains_signature_line(page, match_rect) -> bool:
     return False
 
 
-def _filter_by_dominant_patterns(
-    matches: list[SignMatch],
-    signer_tokens: list[str] | None = None,
-    min_pages: int = 2,
-) -> list[SignMatch]:
+def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -> list[SignMatch]:
     """Базовая директива: подписант один → паттерн места подписи единообразен по всему договору.
 
     Доминирующий паттерн = покрытие ≥ 50% от максимального покрытия среди всех паттернов
-    (и не менее min_pages).
-
-    На каждой странице где есть dominant, non-dominant матчи дропаются ЕСЛИ ИХ context
-    НЕ содержит токенов подписанта (ФИО). Это различает:
-    - "Руководитель службы заказчика ____" (форма, нет ФИО) → дроп
-    - "________________ (Лебедев А.П.)" (реальная подпись) → keep
+    (и не менее min_pages). На каждой странице где есть матч доминирующего паттерна,
+    матчи остальных паттернов отбрасываются.
     """
     if not matches:
         return matches
@@ -317,35 +310,17 @@ def _filter_by_dominant_patterns(
     if not dominant:
         return matches
 
+    # Страницы где сработал хотя бы один доминирующий паттерн
     pages_with_dominant: set = set()
     for m in matches:
         if m.pattern in dominant:
             pages_with_dominant.add(m.page)
 
-    # signer_tokens: ["Лебедев", "Алексей", "Петрович"] и т.п.
-    signer_lower = [t.lower() for t in (signer_tokens or []) if len(t) >= 3]
-
     filtered = []
     for m in matches:
-        if m.pattern in dominant:
-            filtered.append(m)
+        if m.page in pages_with_dominant and m.pattern not in dominant:
             continue
-
-        if m.page not in pages_with_dominant:
-            filtered.append(m)
-            continue
-
-        # Non-dominant на странице с dominant → проверяем signer tokens в context
-        if signer_lower:
-            ctx_lower = m.context.lower()
-            has_signer = any(t in ctx_lower for t in signer_lower)
-            if has_signer:
-                filtered.append(m)  # реальная подпись — keep
-                continue
-
-        # Нет signer tokens → generic form field → дроп
-        continue
-
+        filtered.append(m)
     return filtered
 
 
@@ -480,16 +455,9 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         pdf_doc.close()
 
     # Фильтр 8: доминирующий паттерн выигрывает.
-    # Извлекаем signer tokens для различения реальных подписей от формовых полей.
-    signer = party.get("signer", "")
-    signer_tokens = []
-    if signer:
-        for w in re.findall(r"[А-ЯA-ZЁ][а-яa-zА-ЯA-ZёЁ\-]{2,}", signer):
-            signer_tokens.append(w)
-        # Инициалы: "А.П." → "А.П."
-        for ini in re.findall(r"[А-ЯA-ZЁ]\.[А-ЯA-ZЁ]\.", signer):
-            signer_tokens.append(ini)
-    raw_matches = _filter_by_dominant_patterns(raw_matches, signer_tokens=signer_tokens, min_pages=2)
+    # Если один паттерн = footer-шаблон документа (сработал на 2+ страницах),
+    # отбрасываем матчи "слабых" паттернов на тех же страницах.
+    raw_matches = _filter_by_dominant_patterns(raw_matches, min_pages=2)
 
     return raw_matches
 
@@ -525,3 +493,122 @@ def find_signatures_smart(
         print(f"[finder] llm_fallback error: {e}")
 
     return [], "regex"
+
+
+# ── Якорный API (v1.7) ────────────────────────────────────────────────────────
+
+def apply_template_anchors(doc, template) -> list[SignMatch]:
+    """Применяет якоря шаблона к новому документу.
+
+    Для каждого якоря ищет generated_pattern в тексте страниц,
+    с учётом context_before/context_after для дезамбигуации.
+    Возвращает list[SignMatch] с bbox.
+
+    Готово к v1.8 (template matching). В v1.7 не вызывается автоматически.
+    """
+    from core.anchor_builder import TextAnchor
+
+    matches: list[SignMatch] = []
+    counter = 0
+
+    pdf_doc = fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+    try:
+        anchors = template.anchors or []
+        for raw_anchor in anchors:
+            # anchors хранятся как dict после сериализации
+            if isinstance(raw_anchor, dict):
+                anchor = TextAnchor(**raw_anchor)
+            else:
+                anchor = raw_anchor
+
+            pattern_str = anchor.generated_pattern
+            try:
+                regex = re.compile(pattern_str, re.IGNORECASE | re.UNICODE)
+            except re.error:
+                sys.stderr.write(f"[finder] bad anchor pattern: {pattern_str}\n")
+                continue
+
+            # Определяем страницы для поиска по page_hint
+            if anchor.page_hint == "first":
+                page_range = [0]
+            elif anchor.page_hint == "last":
+                page_range = [len(doc.pages) - 1]
+            elif anchor.page_hint == "any":
+                page_range = range(len(doc.pages))
+            else:
+                try:
+                    page_range = [int(anchor.page_hint)]
+                except ValueError:
+                    page_range = range(len(doc.pages))
+
+            for page_idx in page_range:
+                if page_idx >= len(doc.pages):
+                    continue
+                text = doc.pages[page_idx].text
+                page = pdf_doc[page_idx]
+
+                for m in regex.finditer(text):
+                    matched_text = m.group(0)
+
+                    # Дезамбигуация по контексту
+                    if anchor.context_before:
+                        ctx_start = max(0, m.start() - len(anchor.context_before) - 20)
+                        preceding = text[ctx_start:m.start()]
+                        if anchor.context_before.strip() and anchor.context_before.strip().lower() not in preceding.lower():
+                            continue
+
+                    rects = _find_signature_bbox(page, matched_text)
+                    for rect in rects:
+                        if (rect.y1 - rect.y0) > MAX_BBOX_HEIGHT_PT:
+                            continue
+                        counter += 1
+                        start = max(0, m.start() - 40)
+                        end = min(len(text), m.end() + 40)
+                        ctx = text[start:end].replace("\n", " ").strip()
+
+                        matches.append(SignMatch(
+                            id=f"tpl_{counter:03d}",
+                            page=page_idx,
+                            bbox=tuple(rect),
+                            context=ctx,
+                            party=getattr(template, "name", "template"),
+                            pattern=pattern_str,
+                        ))
+    except Exception as e:
+        sys.stderr.write(f"[finder] apply_template_anchors: {e}\n")
+    finally:
+        pdf_doc.close()
+
+    return matches
+
+
+def regex_match_to_anchor(match, page_idx: int, language: str):
+    """Конвертирует regex-матч (SignMatch) → TextAnchor с added_by='auto_regex'.
+
+    Используется в pipelineAuto1 при сохранении результата в шаблон.
+    """
+    from core.anchor_builder import build_anchor_from_regex_match
+
+    bbox = match.bbox if isinstance(match.bbox, tuple) else tuple(match.bbox)
+    ctx = match.context or ""
+    # Грубое разделение контекста по matched_text
+    pattern_str = match.pattern or ""
+    try:
+        m = re.search(pattern_str, ctx, re.IGNORECASE | re.UNICODE)
+        if m:
+            ctx_before = ctx[:m.start()]
+            ctx_after = ctx[m.end():]
+        else:
+            ctx_before, ctx_after = "", ""
+    except Exception:
+        ctx_before, ctx_after = "", ""
+
+    return build_anchor_from_regex_match(
+        pattern=match.pattern,
+        match_text=match.context,
+        match_bbox=bbox,
+        page_idx=page_idx,
+        language=language,
+        context_before=ctx_before,
+        context_after=ctx_after,
+    )

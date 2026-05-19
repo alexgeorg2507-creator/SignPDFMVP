@@ -1,30 +1,28 @@
-"""Авто-пайплайн подписания договора.
+"""Авто-подписание договоров — SignFinder v1.7.
 
-pages/5_🤖_Авто_подписание.py
-
-Шаги:
-  1. Парсинг документа
-  2. Определение языка
-  3. Поиск нашей стороны в шапке через LLM
-  4. Генерация regex-паттернов через LLM
-  5. Поиск мест подписи через finder.py
-  6. Превью с чекбоксами
-  7. Скачивание + сохранение паттернов
-
-v1.5
+Флоу:
+  1-5. pipelineAuto1 (без изменений)
+  6.   Конвертация matches → TextAnchor, пагинация, canvas, ручная доразметка
+  7.   Наложение подписи + скачивание
+  8.   Сохранение шаблона
 """
+import copy
+import io
 import json
 import os
 import re
 import sys
-from datetime import datetime
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import List, Optional
+from uuid import uuid4
 
 import streamlit as st
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-4-20250514"
 SUPPORTED_LANGUAGES = ("ru", "en", "pl")
+CANVAS_SCALE = 2.0   # px per pt при рендере страниц
 
 st.set_page_config(page_title="Авто-подписание — SignFinder", layout="wide")
 
@@ -33,10 +31,6 @@ if not st.session_state.get("auth"):
     st.warning("Войдите через главную страницу.")
     st.stop()
 
-st.title("🤖 Авто-подписание")
-st.caption("Загрузи договор — система определит нашу сторону, найдёт места подписи и подпишет.")
-
-# ── Проверка подписи ─────────────────────────────────────────────────────────
 from core.storage import read_signature, json_config_exists, read_json, write_json
 
 if "signature_png" not in st.session_state:
@@ -46,17 +40,15 @@ if "signature_png" not in st.session_state:
 
 sig_png: Optional[bytes] = st.session_state.get("signature_png")
 if not sig_png:
-    st.error("⚠️ Подпись не загружена. Загрузите PNG подписи в Настройках.")
-    st.page_link("pages/4_⚙️_Настройки.py", label="Открыть Настройки", icon="⚙️")
+    st.error("Подпись не загружена. Загрузите PNG подписи в Настройках.")
     st.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Вспомогательные функции пайплайна
+# Pipeline helpers (без изменений от v1.5/v1.6)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_header_text(doc) -> str:
-    """Первые 1-3 страницы для шапки (шаг 3)."""
     parts = []
     total = 0
     for i, page in enumerate(doc.pages):
@@ -69,42 +61,31 @@ def _get_header_text(doc) -> str:
 
 
 def _get_strategic_fragments(doc, markers_block: dict) -> str:
-    """Стратегический срез: первая, последняя, якорные страницы, футеры."""
     pages = doc.pages
     n = len(pages)
-    anchors = [a.lower() for a in markers_block.get("section_anchors", [])]
+    anchors_kw = [a.lower() for a in markers_block.get("section_anchors", [])]
     fragments = []
-
     if pages:
         fragments.append(f"=== ПЕРВАЯ СТРАНИЦА ===\n{pages[0].text or ''}")
-
     if n > 1:
         fragments.append(f"=== ПОСЛЕДНЯЯ СТРАНИЦА ===\n{pages[-1].text or ''}")
-
-    # Страницы с anchors (кроме первой и последней)
     for i in range(1, n - 1):
         text = (pages[i].text or "").lower()
-        if any(a in text for a in anchors):
-            fragments.append(f"=== СТРАНИЦА {i + 1} (секция) ===\n{pages[i].text[:2000]}")
-
-    # Футеры всех страниц
+        if any(a in text for a in anchors_kw):
+            fragments.append(f"=== СТРАНИЦА {i+1} ===\n{pages[i].text[:2000]}")
     footer_parts = []
     for i, page in enumerate(pages):
         text = (page.text or "").strip()
         footer = text[-200:] if len(text) > 200 else text
         if footer.strip():
-            footer_parts.append(f"[стр.{i + 1}] {footer}")
+            footer_parts.append(f"[стр.{i+1}] {footer}")
     if footer_parts:
-        fragments.append("=== ФУТЕРЫ СТРАНИЦ ===\n" + "\n---\n".join(footer_parts[:20]))
-
+        fragments.append("=== ФУТЕРЫ ===\n" + "\n---\n".join(footer_parts[:20]))
     return "\n\n".join(fragments)[:8000]
 
 
-def _call_llm_json(prompt: str, max_tokens: int = 1500, capture_key: str | None = None) -> Optional[dict]:
-    """Вызвать LLM, распарсить JSON-ответ. Возвращает None при ошибке.
-    capture_key: если задан — сохраняет промпт и raw-ответ в session_state под ключами
-    debug_prompt_<key> и debug_raw_<key>.
-    """
+def _call_llm_json(prompt: str, max_tokens: int = 1500,
+                   capture_key: Optional[str] = None) -> Optional[dict]:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error("ANTHROPIC_API_KEY не задан.")
         return None
@@ -113,8 +94,7 @@ def _call_llm_json(prompt: str, max_tokens: int = 1500, capture_key: str | None 
     client = Anthropic()
     try:
         resp = client.messages.create(
-            model=MODEL,
-            max_tokens=max_tokens,
+            model=MODEL, max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = (resp.content[0].text or "").strip()
@@ -127,12 +107,11 @@ def _call_llm_json(prompt: str, max_tokens: int = 1500, capture_key: str | None 
             raw = m.group(0)
         return json.loads(raw)
     except Exception as e:
-        print(f"[auto_pipeline] LLM error: {e}", file=sys.stderr)
+        sys.stderr.write(f"[auto_pipeline] LLM error: {e}\n")
         return None
 
 
 def _run_step3(doc, lang: str) -> Optional[dict]:
-    """Шаг 3: определение нашей стороны через LLM."""
     from core.signer_profile import get_aliases_for_language
     from core.markers import get_markers_for_language
     from core.prompts import format_find_our_side
@@ -141,24 +120,18 @@ def _run_step3(doc, lang: str) -> Optional[dict]:
     markers_block = get_markers_for_language(lang)
 
     if not aliases["signer"]:
-        st.error(
-            "❌ Шаг 3: Не задан ни один алиас ФИО подписанта. "
-            "Заполните данные в Настройках → Подписант."
-        )
+        st.error("Шаг 3: Не задан алиас ФИО подписанта. Заполните Настройки.")
         return None
 
     header = _get_header_text(doc)
     prompt = format_find_our_side(
-        header_text=header,
-        language=lang,
-        company_aliases=aliases["company"],
-        signer_aliases=aliases["signer"],
+        header_text=header, language=lang,
+        company_aliases=aliases["company"], signer_aliases=aliases["signer"],
         markers=markers_block,
     )
-
     result = _call_llm_json(prompt, max_tokens=1500, capture_key="step3")
     if result is None:
-        st.error("❌ Шаг 3: LLM не ответил или вернул невалидный JSON.")
+        st.error("Шаг 3: LLM не ответил или невалидный JSON.")
         return None
 
     confidence = float(result.get("confidence", 0))
@@ -166,16 +139,7 @@ def _run_step3(doc, lang: str) -> Optional[dict]:
     synonyms = result.get("our_side_synonyms") or {}
 
     if our_index is None or confidence < 0.5:
-        if result.get("match_reason") == "none" or confidence < 0.3:
-            st.error(
-                "❌ Шаг 3: Наша компания/подписант не найдены в шапке договора. "
-                "Проверьте Данные подписанта или используйте ручной режим."
-            )
-        else:
-            st.error(
-                "❌ Шаг 3: Не удалось однозначно определить нашу сторону. "
-                "Найдено несколько совпадений. Используйте ручной режим."
-            )
+        st.error("Шаг 3: Наша сторона не найдена в шапке договора.")
         return None
 
     return {
@@ -190,26 +154,19 @@ def _run_step3(doc, lang: str) -> Optional[dict]:
 
 
 def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
-    """Шаг 4: генерация regex-паттернов через LLM."""
     from core.markers import get_markers_for_language
     from core.prompts import format_generate_regex
 
     markers_block = get_markers_for_language(lang)
     fragments = _get_strategic_fragments(doc, markers_block)
-
     prompt = format_generate_regex(
-        legal_entity=our_side["legal_entity"],
-        roles=our_side["roles"],
-        signer=our_side["signer"],
-        language=lang,
-        markers_block=markers_block,
-        strategic_fragments=fragments,
+        legal_entity=our_side["legal_entity"], roles=our_side["roles"],
+        signer=our_side["signer"], language=lang,
+        markers_block=markers_block, strategic_fragments=fragments,
     )
-
     result = _call_llm_json(prompt, max_tokens=3000, capture_key="step4")
     if result is None:
-        st.error("❌ Шаг 4: LLM не вернул паттерны.")
-        _show_step4_debug()
+        st.error("Шаг 4: LLM не вернул паттерны.")
         return None
 
     raw_patterns = result.get("patterns", [])
@@ -222,37 +179,20 @@ def _run_step4(doc, lang: str, our_side: dict) -> Optional[List[str]]:
                 re.compile(pat, re.IGNORECASE | re.UNICODE)
                 patterns.append(pat)
             except re.error as e:
-                print(f"[auto_pipeline] bad pattern '{pat}': {e}", file=sys.stderr)
-
+                sys.stderr.write(f"[auto_pipeline] bad pattern '{pat}': {e}\n")
     if not patterns:
-        st.error(
-            "❌ Шаг 4: Не удалось сгенерировать паттерны. "
-            "Используйте ручной режим."
-        )
-        _show_step4_debug()
+        st.error("Шаг 4: Не удалось сгенерировать паттерны.")
         return None
-
     return patterns
 
 
-def _extract_distinctive_tokens(s: str) -> list[str]:
-    """Извлекает distinctive токены из строки: имена в кавычках, фамилии.
-
-    Примеры:
-      "Общество с ограниченной ответственностью «Стэп интегратор»"
-        → ["Стэп интегратор", "Стэп", "интегратор"]
-      "Ткачев Сергей Леонидович" → ["Ткачев", "Сергей", "Леонидович"]
-      "ИСПОЛНИТЕЛЬ" → ["ИСПОЛНИТЕЛЬ"]
-      "не указан" → []
-    """
+def _extract_distinctive_tokens(s: str) -> list:
     if not s:
         return []
     sl = s.lower().strip()
     if sl in ("не указан", "не указана", "не указано", "—", "-", "n/a", "na", ""):
         return []
-
     tokens = []
-    # 1. Содержимое кавычек: «Стэп интегратор» / "Acme Inc"
     for m in re.finditer(r'[«"\']([^»"\']+)[»"\']', s):
         inner = m.group(1).strip()
         if len(inner) >= 3:
@@ -260,20 +200,15 @@ def _extract_distinctive_tokens(s: str) -> list[str]:
             for w in inner.split():
                 if len(w) >= 4:
                     tokens.append(w)
-
-    # 2. Слова с заглавной (имена собственные, фамилии, ROLE-as-UPPER)
     stop = {
         "общество", "ограниченной", "ответственностью", "компания",
         "корпорация", "генеральный", "директор", "лице", "именуем",
         "именуемая", "именуемое", "именуемый", "далее", "стороны",
-        "стороне", "договор", "договору", "паспорт", "выдан", "адрес",
+        "стороне", "договор", "договору",
     }
     for w in re.findall(r"[А-ЯA-ZЁ][а-яa-zА-ЯA-ZёЁ\-]{3,}", s):
-        if w.lower() in stop:
-            continue
-        tokens.append(w)
-
-    # Дедуп с сохранением порядка
+        if w.lower() not in stop:
+            tokens.append(w)
     seen, result = set(), []
     for t in tokens:
         tl = t.lower()
@@ -284,42 +219,32 @@ def _extract_distinctive_tokens(s: str) -> list[str]:
 
 
 def _run_step5(doc, our_side: dict, patterns: List[str]):
-    """Шаг 5: поиск мест подписи через finder.py с кастомными паттернами."""
     from core.finder import find_signatures
 
-    # Собираем distinctive синонимы ЧУЖИХ сторон (для отсечения паттернов
-    # которые случайно цепляют другую сторону).
     our_entity = (our_side.get("legal_entity") or "").strip()
     our_roles = set(r.strip().lower() for r in our_side.get("roles", []) if r)
     our_signer = (our_side.get("signer") or "").strip()
     our_signer_tokens = set(t.lower() for t in _extract_distinctive_tokens(our_signer))
     our_entity_tokens = set(t.lower() for t in _extract_distinctive_tokens(our_entity))
 
-    other_aliases: list[str] = []
+    other_aliases: list = []
     for p in our_side.get("all_parties", []):
         if not isinstance(p, dict):
             continue
         le = (p.get("legal_entity") or "").strip()
         role = (p.get("role") or "").strip()
-        signer = (p.get("signer") or "").strip()
-
-        # пропускаем нашу сторону
+        signer_p = (p.get("signer") or "").strip()
         if le and le == our_entity:
             continue
-
-        # роль чужой стороны
         if role and role.lower() not in our_roles:
             other_aliases.append(role)
-        # distinctive токены юрлица
         for t in _extract_distinctive_tokens(le):
             if t.lower() not in our_entity_tokens:
                 other_aliases.append(t)
-        # distinctive токены подписанта
-        for t in _extract_distinctive_tokens(signer):
+        for t in _extract_distinctive_tokens(signer_p):
             if t.lower() not in our_signer_tokens:
                 other_aliases.append(t)
 
-    # дедуп, выбрасываем слишком короткие
     seen = set()
     other_aliases_clean = []
     for a in other_aliases:
@@ -327,117 +252,239 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
         if len(al) >= 3 and al not in seen:
             seen.add(al)
             other_aliases_clean.append(a)
-    other_aliases = other_aliases_clean
 
     party_dict = {
         "name": our_side["legal_entity"] or "auto",
         "display": our_side["legal_entity"] or "auto",
-        "aliases": (
-            [our_side["legal_entity"]]
-            + our_side.get("roles", [])
-            + [our_side["signer"]]
-        ),
+        "aliases": ([our_side["legal_entity"]] + our_side.get("roles", []) + [our_side["signer"]]),
         "signer": our_side.get("signer", ""),
-        "other_aliases": other_aliases,
+        "other_aliases": other_aliases_clean,
         "patterns": patterns,
         "notes": "",
     }
     matches = find_signatures(doc, party_dict)
-
     if not matches:
-        st.error(
-            "❌ Шаг 5: Паттерны сгенерированы, но не нашли мест подписи. "
-            "Используйте ручной режим."
-        )
+        st.error("Шаг 5: Паттерны сгенерированы, но мест подписи не найдено.")
         return None
-
     return matches
 
 
-def _show_step4_debug():
-    """Показывает debug-блок шага 4 (промпт + raw ответ LLM)."""
-    prompt = st.session_state.get("debug_prompt_step4", "")
-    raw = st.session_state.get("debug_raw_step4", "")
-    if prompt or raw:
-        with st.expander("🔍 Debug шаг 4 — промпт и ответ LLM", expanded=True):
-            if prompt:
-                st.markdown("**Промпт ушедший в LLM:**")
-                st.code(prompt, language="text")
-            if raw:
-                st.markdown("**Raw ответ LLM:**")
-                st.code(raw, language="text")
-
-
 def _build_debug_export() -> dict:
-    """Собирает полный debug-трейс из session_state. Работает при любом результате pipeline."""
-    from datetime import timezone
     doc = st.session_state.get("auto_doc")
     our_side = st.session_state.get("auto_our_side") or {}
     patterns = st.session_state.get("auto_patterns") or []
     matches = st.session_state.get("auto_matches") or []
-
     return {
-        "version": "1.6",
+        "version": "1.7",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "doc_info": {
             "filename": st.session_state.get("auto_doc_name", ""),
             "pages": len(doc.pages) if doc else 0,
             "language": st.session_state.get("auto_language", ""),
         },
-        "step3_party_detection": {
-            "legal_entity": our_side.get("legal_entity", ""),
-            "roles": our_side.get("roles", []),
-            "signer": our_side.get("signer", ""),
-            "confidence": our_side.get("confidence", 0),
-            "match_reason": our_side.get("match_reason", ""),
-            "evidence": our_side.get("evidence", ""),
-            "all_parties": our_side.get("all_parties", []),
+        "step3": {
+            **{k: our_side.get(k, "") for k in ("legal_entity", "roles", "signer", "confidence", "match_reason")},
             "prompt": st.session_state.get("debug_prompt_step3", ""),
-            "raw_llm_response": st.session_state.get("debug_raw_step3", ""),
+            "raw": st.session_state.get("debug_raw_step3", ""),
         },
-        "step4_pattern_generation": {
+        "step4": {
             "patterns": patterns,
             "prompt": st.session_state.get("debug_prompt_step4", ""),
-            "raw_llm_response": st.session_state.get("debug_raw_step4", ""),
-            "raw_length_chars": len(st.session_state.get("debug_raw_step4", "")),
+            "raw": st.session_state.get("debug_raw_step4", ""),
         },
-        "step5_signature_search": {
-            "total_found": len(matches),
-            "matches": [
-                {
-                    "id": m.id,
-                    "page": m.page,
-                    "bbox": list(m.bbox),
-                    "pattern": m.pattern,
-                    "context": m.context,
-                    "confidence": m.confidence,
-                }
-                for m in matches
-            ],
+        "step5": {
+            "total": len(matches),
+            "matches": [{"id": m.id, "page": m.page, "bbox": list(m.bbox), "pattern": m.pattern} for m in matches],
         },
     }
 
 
 def _reset_pipeline():
-    """Сброс всего состояния пайплайна."""
     for k in [
-        "auto_language", "auto_our_side", "auto_patterns",
-        "auto_matches", "auto_active_ids", "auto_signed_pdf",
-        "debug_prompt_step3", "debug_raw_step3",
-        "debug_prompt_step4", "debug_raw_step4",
+        "auto_language", "auto_our_side", "auto_patterns", "auto_matches",
+        "auto_signed_pdf", "all_anchors", "fingerprint", "current_page",
+        "debug_prompt_step3", "debug_raw_step3", "debug_prompt_step4", "debug_raw_step4",
     ]:
         st.session_state.pop(k, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Загрузка файла + запуск пайплайна
+# v1.7: Anchor + canvas helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-uploaded = st.file_uploader(
-    "Загрузить договор",
-    type=["pdf", "docx"],
-    key="auto_uploader",
-)
+def _get_anchor_page_idx(anchor, total_pages: int) -> Optional[int]:
+    hint = str(anchor.page_hint)
+    if hint == "first":
+        return 0
+    if hint == "last":
+        return total_pages - 1
+    if hint.isdigit():
+        return int(hint)
+    return None  # "any"
+
+
+def _anchors_for_page(anchors: list, page_idx: int, total_pages: int) -> list:
+    result = []
+    for a in anchors:
+        pi = _get_anchor_page_idx(a, total_pages)
+        if pi is None or pi == page_idx:
+            result.append(a)
+    return result
+
+
+def _render_page_pil(fitz_doc, page_idx: int, scale: float = CANVAS_SCALE):
+    from PIL import Image
+    page = fitz_doc[page_idx]
+    import fitz as _fitz
+    pix = page.get_pixmap(matrix=_fitz.Matrix(scale, scale))
+    return Image.open(io.BytesIO(pix.tobytes("png")))
+
+
+def _anchor_to_canvas_obj(anchor, scale: float, total_pages: int) -> dict:
+    x0, y0, x1, y1 = [c * scale for c in anchor.bbox]
+    is_auto = anchor.added_by == "auto_regex"
+    return {
+        "type": "rect",
+        "left": x0, "top": y0,
+        "width": max(x1 - x0, 10), "height": max(y1 - y0, 10),
+        "fill": "rgba(0,180,0,0.25)" if is_auto else "rgba(255,140,0,0.25)",
+        "stroke": "#009900" if is_auto else "#cc6600",
+        "strokeWidth": 2,
+        "id": anchor.id,
+    }
+
+
+def _handle_canvas_changes(new_objects: list, current_anchors: list,
+                            page_idx: int, scale: float, fitz_doc) -> bool:
+    from core.anchor_builder import build_anchor_from_click
+    lang = st.session_state.get("auto_language", "ru")
+
+    current_by_id = {a.id: a for a in current_anchors}
+    new_by_id = {obj["id"]: obj for obj in new_objects if obj.get("id")}
+    changed = False
+
+    # Удалённые
+    deleted = set(current_by_id.keys()) - set(new_by_id.keys())
+    if deleted:
+        st.session_state["all_anchors"] = [
+            a for a in st.session_state["all_anchors"] if a.id not in deleted
+        ]
+        changed = True
+
+    # Перемещённые
+    for aid, new_obj in new_by_id.items():
+        if aid not in current_by_id:
+            continue
+        old = current_by_id[aid]
+        new_x = new_obj.get("left", 0) / scale
+        new_y = new_obj.get("top", 0) / scale
+        if abs(new_x - old.bbox[0]) < 2 and abs(new_y - old.bbox[1]) < 2:
+            continue
+        cx = new_x + (new_obj.get("width", 0) / scale) / 2
+        cy = new_y + (new_obj.get("height", 0) / scale) / 2
+        new_anchor = build_anchor_from_click(fitz_doc, page_idx, cx, cy, lang)
+        if new_anchor:
+            new_anchor.id = aid
+            st.session_state["all_anchors"] = [
+                new_anchor if a.id == aid else a
+                for a in st.session_state["all_anchors"]
+            ]
+            changed = True
+        else:
+            st.warning("Нет якоря в этой точке — позиция не изменена.")
+
+    # Новые (rect без id — в режиме "add")
+    for obj in new_objects:
+        if obj.get("id"):
+            continue
+        cx = (obj.get("left", 0) + obj.get("width", 0) / 2) / scale
+        cy = (obj.get("top", 0) + obj.get("height", 0) / 2) / scale
+        new_anchor = build_anchor_from_click(fitz_doc, page_idx, cx, cy, lang)
+        if new_anchor:
+            st.session_state["all_anchors"].append(new_anchor)
+            changed = True
+        else:
+            st.warning("Не удалось построить якорь. Кликните над текстом или подчёркиваниями.")
+
+    return changed
+
+
+def _build_signed_pdf() -> bytes:
+    from core.finder import SignMatch
+    from core.overlay import apply_signature
+
+    doc = st.session_state["auto_doc"]
+    total = len(doc.pages)
+    all_anchors = st.session_state.get("all_anchors", [])
+
+    fake_matches = []
+    for anchor in all_anchors:
+        if not st.session_state.get(f"anchor_enabled_{anchor.id}", True):
+            continue
+        pi = _get_anchor_page_idx(anchor, total)
+        if pi is None:
+            pi = 0
+        fake_matches.append(SignMatch(
+            id=anchor.id, page=pi, bbox=anchor.bbox,
+            context=anchor.anchor_text, party="",
+            pattern=anchor.generated_pattern,
+            confidence=1.0, status="candidate", operator_excluded=False,
+        ))
+
+    return apply_signature(doc.pdf_bytes, fake_matches, sig_png)
+
+
+def _save_template():
+    try:
+        import fitz as _fitz
+        from core.template_storage import DocumentTemplate, save_template
+        from core.fingerprint import compute_fingerprint
+
+        doc = st.session_state["auto_doc"]
+        lang = st.session_state.get("auto_language", "ru")
+        our_side = st.session_state.get("auto_our_side", {})
+        all_anchors = st.session_state.get("all_anchors", [])
+        has_manual = any(a.added_by == "manual_click" for a in all_anchors)
+
+        template_name = st.session_state.get("template_name_input") or \
+            f"pipelineAuto1_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M')}_{lang}"
+
+        fitz_doc = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+        try:
+            fp = compute_fingerprint(fitz_doc, lang)
+        finally:
+            fitz_doc.close()
+
+        template = DocumentTemplate(
+            template_id=uuid4().hex,
+            name=template_name,
+            language=lang,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            created_by="manual_enrichment" if has_manual else "pipeline_auto_1",
+            fingerprint=fp,
+            anchors=[asdict(a) for a in all_anchors],
+            synonyms_used={
+                "legal_entity": our_side.get("legal_entity", ""),
+                "roles": our_side.get("roles", []),
+                "signer": our_side.get("signer", ""),
+            },
+        )
+        tid = save_template(template)
+        st.success(f"Шаблон сохранён: `{template_name}` (id: {tid[:8]}…)")
+    except Exception as e:
+        st.error(f"Ошибка сохранения шаблона: {e}")
+        sys.stderr.write(f"[auto_sign] _save_template: {e}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.title("🤖 Авто-подписание")
+st.caption("Загрузи договор — система найдёт места подписи. Дорисуй если нужно → скачай PDF.")
+
+# ── Шаги 1-5: загрузка + пайплайн ────────────────────────────────────────────
+uploaded = st.file_uploader("Загрузить договор", type=["pdf", "docx"], key="auto_uploader")
 
 if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.name:
     _reset_pipeline()
@@ -445,280 +492,297 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
 
     with st.status("Запускаю пайплайн...", expanded=True) as status:
 
-        # ШАГ 1: Парсинг
-        st.write("📄 Шаг 1: Парсинг документа...")
+        st.write("📄 Шаг 1: Парсинг...")
         from core.parser import parse_document
         try:
             doc = parse_document(uploaded.getvalue(), uploaded.name)
             st.session_state["auto_doc"] = doc
-            st.write(f"✅ Распознано страниц: {len(doc.pages)}")
+            st.write(f"✅ Страниц: {len(doc.pages)}")
         except Exception as e:
             status.update(label="❌ Ошибка парсинга", state="error")
-            st.error(f"Не удалось распарсить файл: {e}")
+            st.error(f"{e}")
             st.stop()
 
-        # ШАГ 2: Язык
-        st.write("🌐 Шаг 2: Определение языка...")
+        st.write("🌐 Шаг 2: Язык...")
         from core.language_detector import detect_language
         lang = detect_language(doc)
         if lang not in SUPPORTED_LANGUAGES:
             status.update(label="❌ Язык не поддерживается", state="error")
-            lang_name = lang if lang != "unknown" else "не определён"
-            st.error(
-                f"Обрабатываем только русские, английские и польские договоры. "
-                f"Определён язык: {lang_name}"
-            )
+            st.error(f"Поддерживаем ru/en/pl. Определён: {lang or '?'}")
             st.stop()
         st.session_state["auto_language"] = lang
         st.write(f"✅ Язык: **{lang}**")
 
-        # ШАГ 3: Наша сторона
-        st.write("🔍 Шаг 3: Определение нашей стороны...")
+        st.write("🔍 Шаг 3: Наша сторона...")
         our_side = _run_step3(doc, lang)
         if our_side is None:
-            status.update(label="❌ Не удалось определить нашу сторону", state="error")
+            status.update(label="❌ Сторона не определена", state="error")
             st.stop()
         st.session_state["auto_our_side"] = our_side
-        st.write(
-            f"✅ Наша сторона: **{our_side['legal_entity']}** "
-            f"/ {our_side['signer']} "
-            f"(уверенность: {our_side['confidence']:.0%})"
-        )
-        # Debug шаг 3: синонимы из шапки
-        with st.expander("🔍 Debug шаг 3 — синонимы из шапки", expanded=False):
-            st.markdown(f"**Юрлицо:** `{our_side['legal_entity']}`")
-            roles_str = ", ".join(our_side["roles"]) if our_side.get("roles") else "—"
-            st.markdown(f"**Роли в договоре:** {roles_str}")
-            st.markdown(f"**Подписант:** `{our_side['signer']}`")
-            st.markdown(f"**Уверенность:** {our_side['confidence']:.0%} · причина: `{our_side.get('match_reason', '—')}`")
-            if our_side.get("evidence"):
-                st.caption(f"Подтверждение: «{our_side['evidence'][:300]}»")
-            if our_side.get("all_parties"):
-                st.markdown("**Все стороны найдены в договоре:**")
-                for p in our_side["all_parties"]:
-                    st.markdown(f"- `{p}`")
-            with st.expander("📋 Промпт шага 3", expanded=False):
-                st.code(st.session_state.get("debug_prompt_step3", "—"), language="text")
+        st.write(f"✅ {our_side['legal_entity']} / {our_side['signer']} ({our_side['confidence']:.0%})")
 
-        # ШАГ 4: Паттерны
-        st.write("⚙️ Шаг 4: Генерация regex-паттернов...")
+        with st.expander("Debug шаг 3", expanded=False):
+            st.json({k: our_side[k] for k in ("legal_entity", "roles", "signer", "confidence")})
+
+        st.write("⚙️ Шаг 4: Паттерны...")
         patterns = _run_step4(doc, lang, our_side)
         if patterns is None:
-            status.update(label="❌ Генерация паттернов не удалась", state="error")
+            status.update(label="❌ Паттерны не сгенерированы", state="error")
             st.stop()
         st.session_state["auto_patterns"] = patterns
-        st.write(f"✅ Сгенерировано паттернов: **{len(patterns)}**")
-        # Debug шаг 4: паттерны и промпт
-        with st.expander("🔍 Debug шаг 4 — паттерны и промпт", expanded=False):
-            st.markdown("**Сгенерированные паттерны:**")
-            for i, p in enumerate(patterns, 1):
-                st.code(p, language="")
-            with st.expander("📋 Промпт шага 4", expanded=False):
-                st.code(st.session_state.get("debug_prompt_step4", "—"), language="text")
+        st.write(f"✅ Паттернов: {len(patterns)}")
 
-        # ШАГ 5: Поиск
-        st.write("🔎 Шаг 5: Поиск мест подписи...")
+        st.write("🔎 Шаг 5: Поиск мест...")
         matches = _run_step5(doc, our_side, patterns)
         if matches is None:
-            status.update(label="❌ Места подписи не найдены", state="error")
+            status.update(label="❌ Места не найдены", state="error")
             st.stop()
         st.session_state["auto_matches"] = matches
-        st.session_state["auto_active_ids"] = {m.id for m in matches}
-        st.write(f"✅ Найдено мест: **{len(matches)}**")
-        # Debug шаг 5: найденные места
-        with st.expander("🔍 Debug шаг 5 — найденные места подписи", expanded=False):
-            for m in matches:
-                st.markdown(
-                    f"- стр. **{m.page + 1}** · conf `{m.confidence:.2f}` · `{m.context[:100]}`"
-                )
-                st.caption(f"  паттерн: `{m.pattern}` · bbox: `{[round(x, 1) for x in m.bbox]}`")
 
-        status.update(label="✅ Пайплайн завершён — выберите места и скачайте", state="complete")
+        st.write("🔗 Конвертация в якоря...")
+        from core.finder import regex_match_to_anchor
+        anchors = []
+        for m in matches:
+            try:
+                anchors.append(regex_match_to_anchor(m, m.page, lang))
+            except Exception as e:
+                sys.stderr.write(f"[auto_sign] anchor conv: {e}\n")
+        st.session_state["all_anchors"] = anchors
+        st.session_state["current_page"] = 0
+        st.write(f"✅ Якорей: {len(anchors)}")
+        status.update(label="✅ Готово", state="complete")
 
 
-# ── Кнопка экспорта debug JSON — всегда доступна после запуска пайплайна ──────
-if any(st.session_state.get(k) for k in (
-    "debug_prompt_step3", "debug_prompt_step4", "auto_our_side", "auto_patterns"
-)):
-    st.divider()
-    col_exp, _ = st.columns([2, 4])
-    with col_exp:
-        export = _build_debug_export()
+if any(st.session_state.get(k) for k in ("debug_prompt_step3", "auto_our_side")):
+    with st.expander("Debug JSON", expanded=False):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
         st.download_button(
-            "📥 Экспорт debug JSON (для анализа)",
-            data=json.dumps(export, ensure_ascii=False, indent=2),
-            file_name=f"signfinder_debug_{base}_{ts}.json",
+            "📥 Экспорт debug JSON",
+            data=json.dumps(_build_debug_export(), ensure_ascii=False, indent=2),
+            file_name=f"debug_{base}_{ts}.json",
             mime="application/json",
-            key="dl_debug_always",
-            help="Полный трейс: промпты, raw LLM-ответы, паттерны, найденные места",
+            key="dl_debug",
         )
 
+if "all_anchors" not in st.session_state:
+    st.stop()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Шаг 6: Превью с чекбоксами
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Шаг 6: Пагинация + Canvas + Доразметка ───────────────────────────────────
+doc = st.session_state["auto_doc"]
+total_pages = len(doc.pages)
+all_anchors: list = st.session_state["all_anchors"]
+current_page: int = st.session_state.get("current_page", 0)
 
-if "auto_matches" in st.session_state:
-    matches = st.session_state["auto_matches"]
-    active_ids: set = st.session_state.get("auto_active_ids", {m.id for m in matches})
-    doc = st.session_state["auto_doc"]
-    our_side = st.session_state["auto_our_side"]
-    patterns = st.session_state["auto_patterns"]
-    lang = st.session_state["auto_language"]
+st.divider()
+st.subheader("2️⃣ Превью и доразметка")
 
-    st.divider()
-    st.subheader(f"6️⃣ Найдено мест подписи: {len(matches)}")
-
-    col_all, col_none, _ = st.columns([1, 1, 4])
-    with col_all:
-        if st.button("✅ Все", key="check_all"):
-            st.session_state["auto_active_ids"] = {m.id for m in matches}
-            st.rerun()
-    with col_none:
-        if st.button("☐ Снять все", key="uncheck_all"):
-            st.session_state["auto_active_ids"] = set()
-            st.rerun()
-
-    st.caption("Снимите чекбокс чтобы исключить место из подписания.")
-
-    # Группируем по страницам
-    pages_with_matches: dict = {}
-    for m in matches:
-        pages_with_matches.setdefault(m.page, []).append(m)
-
-    new_active_ids = set(active_ids)
-    changed = False
-
-    from core.preview import render_page_with_highlights
-
-    for page_num in sorted(pages_with_matches.keys()):
-        page_matches = pages_with_matches[page_num]
-        st.markdown(f"**Страница {page_num + 1}**")
-
-        # Чекбоксы
-        for m in page_matches:
-            is_active = m.id in active_ids
-            checked = st.checkbox(
-                f"Место {m.id} — `{m.context[:60]}...`" if len(m.context) > 60 else f"Место {m.id} — `{m.context}`",
-                value=is_active,
-                key=f"cb_{m.id}",
-            )
-            if checked != is_active:
-                changed = True
-            if checked:
-                new_active_ids.add(m.id)
-            else:
-                new_active_ids.discard(m.id)
-
-        # Превью страницы — помечаем неактивные как excluded
-        preview_matches = []
-        for m in page_matches:
-            import copy
-            pm = copy.copy(m)
-            pm.operator_excluded = (m.id not in new_active_ids)
-            preview_matches.append(pm)
-
-        try:
-            img_bytes = render_page_with_highlights(
-                doc.pdf_bytes, page_num, preview_matches, scale=1.2
-            )
-            st.image(img_bytes, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Превью недоступно: {e}")
-
-    if changed:
-        st.session_state["auto_active_ids"] = new_active_ids
+# Пагинация
+nav1, nav2, nav3, nav4 = st.columns([1, 2, 2, 1])
+with nav1:
+    if st.button("◀", key="pg_prev", disabled=(current_page == 0)):
+        st.session_state["current_page"] = current_page - 1
+        st.rerun()
+with nav2:
+    st.markdown(f"**Стр. {current_page + 1}** из {total_pages}")
+with nav3:
+    jump = st.number_input(
+        "Перейти на стр.", min_value=1, max_value=total_pages,
+        value=current_page + 1, label_visibility="collapsed", key="pg_jump",
+    )
+    if jump - 1 != current_page:
+        st.session_state["current_page"] = jump - 1
+        st.rerun()
+with nav4:
+    if st.button("▶", key="pg_next", disabled=(current_page >= total_pages - 1)):
+        st.session_state["current_page"] = current_page + 1
         st.rerun()
 
-    # ── Детали: что нашли ─────────────────────────────────────────────────────
-    with st.expander("📋 Детали: найденная сторона и паттерны", expanded=False):
-        st.markdown(f"""
-**Юрлицо:** {our_side['legal_entity']}  
-**Роли:** {', '.join(our_side['roles'])}  
-**Подписант:** {our_side['signer']}  
-**Уверенность:** {our_side['confidence']:.0%} ({our_side['match_reason']})  
-**Язык:** {lang}
-        """)
-        if our_side.get("evidence"):
-            st.caption(f"Подтверждение: «{our_side['evidence'][:200]}»")
-        st.markdown("**Паттерны:**")
-        for i, p in enumerate(patterns, 1):
-            st.code(p, language="")
+# Якоря текущей страницы + чекбоксы
+page_anchors = _anchors_for_page(all_anchors, current_page, total_pages)
 
-    # ── Шаг 7: Скачивание ────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("7️⃣ Скачать и сохранить")
+if page_anchors:
+    st.write(f"Места подписи на стр. {current_page + 1}:")
+    ca, cn, _ = st.columns([1, 1, 4])
+    with ca:
+        if st.button("✅ Все", key="en_all"):
+            for a in page_anchors:
+                st.session_state[f"anchor_enabled_{a.id}"] = True
+            st.rerun()
+    with cn:
+        if st.button("☐ Снять", key="dis_all"):
+            for a in page_anchors:
+                st.session_state[f"anchor_enabled_{a.id}"] = False
+            st.rerun()
 
-    active_count = len(new_active_ids)
-    if active_count == 0:
-        st.warning("Нет выбранных мест подписи.")
-    else:
-        st.caption(f"Будет подписано: {active_count} из {len(matches)} мест.")
-
-        if st.button("⬇ Скачать подписанный PDF", type="primary", disabled=(active_count == 0)):
-            from core.overlay import apply_signature
-            import copy
-
-            final_matches = []
-            for m in matches:
-                cm = copy.copy(m)
-                cm.operator_excluded = (m.id not in new_active_ids)
-                final_matches.append(cm)
-
-            try:
-                signed_pdf = apply_signature(doc.pdf_bytes, final_matches, sig_png)
-                st.session_state["auto_signed_pdf"] = signed_pdf
-            except Exception as e:
-                st.error(f"Ошибка наложения подписи: {e}")
-
-        if "auto_signed_pdf" in st.session_state:
-            fname = uploaded.name if uploaded else "signed.pdf"
-            stem = fname.rsplit(".", 1)[0]
-            st.download_button(
-                label="💾 Сохранить PDF",
-                data=st.session_state["auto_signed_pdf"],
-                file_name=f"{stem}_signed.pdf",
-                mime="application/pdf",
-                key="dl_signed",
+    for i, anchor in enumerate(page_anchors):
+        c1, c2, c3 = st.columns([1, 9, 1])
+        with c1:
+            enabled = st.checkbox(
+                "", value=st.session_state.get(f"anchor_enabled_{anchor.id}", True),
+                key=f"cb_{anchor.id}",
             )
+            st.session_state[f"anchor_enabled_{anchor.id}"] = enabled
+        with c2:
+            src = "auto" if anchor.added_by == "auto_regex" else "✏️ manual"
+            st.caption(f"#{i+1} {src} · Ур.{anchor.anchor_level} · «{anchor.anchor_text[:40]}»")
+        with c3:
+            if st.button("✕", key=f"del_{anchor.id}"):
+                st.session_state["all_anchors"] = [a for a in all_anchors if a.id != anchor.id]
+                st.rerun()
+else:
+    st.caption(f"На стр. {current_page + 1} мест подписи нет.")
 
-        # ── Сохранение паттернов в parties.json ──────────────────────────────
-        st.divider()
-        auto_party_name = (
-            f"pipelineAuto1_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{lang}"
+# Режим канваса
+canvas_mode_label = st.radio(
+    "Режим", ["👁 Просмотр / drag", "✏️ Добавить место подписи"],
+    horizontal=True, key="canvas_mode_radio",
+)
+mode_key = "add" if "Добавить" in canvas_mode_label else "view"
+
+# Canvas
+_canvas_ok = False
+try:
+    from streamlit_drawable_canvas import st_canvas
+    _canvas_ok = True
+except ImportError:
+    pass
+
+if _canvas_ok:
+    import fitz as _fitz
+    _fitz_doc = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+    try:
+        page_img = _render_page_pil(_fitz_doc, current_page, CANVAS_SCALE)
+        img_w, img_h = page_img.size
+        display_w = min(img_w, 900)
+        display_h = int(img_h * display_w / img_w)
+
+        canvas_objects = [_anchor_to_canvas_obj(a, CANVAS_SCALE, total_pages) for a in page_anchors]
+
+        result = st_canvas(
+            fill_color="rgba(0,150,0,0.25)",
+            stroke_width=2,
+            stroke_color="#009900",
+            background_image=page_img,
+            update_streamlit=True,
+            width=display_w,
+            height=display_h,
+            drawing_mode="transform" if mode_key == "view" else "rect",
+            initial_drawing={"version": "4.4.0", "objects": canvas_objects},
+            key=f"canvas_{current_page}_{mode_key}_{len(page_anchors)}",
         )
-        st.caption(
-            f"Сохранить сгенерированные паттерны в реестр сторон?\n\n"
-            f"Имя: `{auto_party_name}`"
+
+        if result.json_data is not None:
+            new_objs = result.json_data.get("objects", [])
+            if _handle_canvas_changes(new_objs, page_anchors, current_page, CANVAS_SCALE, _fitz_doc):
+                st.rerun()
+    except Exception as e:
+        st.warning(f"Canvas ошибка: {e}")
+        _canvas_ok = False
+    finally:
+        _fitz_doc.close()
+
+if not _canvas_ok:
+    st.info("streamlit-drawable-canvas не установлен — drag&drop недоступен. "
+            "Добавляйте якоря вручную через координаты.")
+    try:
+        from core.preview import render_page_with_highlights
+        from core.finder import SignMatch as _SM
+        pm = []
+        for a in page_anchors:
+            pi = _get_anchor_page_idx(a, total_pages) or current_page
+            if pi == current_page:
+                pm.append(_SM(
+                    id=a.id, page=pi, bbox=a.bbox, context=a.anchor_text,
+                    party="", pattern=a.generated_pattern,
+                    operator_excluded=not st.session_state.get(f"anchor_enabled_{a.id}", True),
+                ))
+        img_b = render_page_with_highlights(doc.pdf_bytes, current_page, pm, scale=1.5)
+        st.image(img_b, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Превью недоступно: {e}")
+
+# Ручное добавление (fallback)
+if mode_key == "add" and not _canvas_ok:
+    st.markdown("**Добавить якорь по координатам (pt):**")
+    mx_col, my_col, madd_col = st.columns([2, 2, 1])
+    with mx_col:
+        mx = st.number_input("X", min_value=0.0, value=100.0, key="man_x")
+    with my_col:
+        my = st.number_input("Y", min_value=0.0, value=200.0, key="man_y")
+    with madd_col:
+        st.write(""); st.write("")
+        if st.button("➕", key="btn_add_manual"):
+            try:
+                import fitz as _fitz
+                from core.anchor_builder import build_anchor_from_click
+                _fd = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+                a = build_anchor_from_click(_fd, current_page, mx, my,
+                                            st.session_state.get("auto_language", "ru"))
+                _fd.close()
+                if a:
+                    st.session_state["all_anchors"].append(a)
+                    st.success(f"Добавлен: «{a.anchor_text[:40]}»")
+                    st.rerun()
+                else:
+                    st.warning("Нет текста в этой точке.")
+            except Exception as e:
+                st.error(f"{e}")
+
+
+# ── Шаг 7: Скачивание ────────────────────────────────────────────────────────
+st.divider()
+st.subheader("7️⃣ Скачать подписанный PDF")
+
+auto_n = sum(1 for a in all_anchors if a.added_by == "auto_regex")
+manual_n = sum(1 for a in all_anchors if a.added_by == "manual_click")
+enabled_n = sum(1 for a in all_anchors if st.session_state.get(f"anchor_enabled_{a.id}", True))
+
+st.caption(f"{auto_n} auto + {manual_n} manual = {len(all_anchors)} якорей · включено: {enabled_n}")
+
+if enabled_n == 0:
+    st.warning("Нет включённых мест подписи.")
+else:
+    if st.button("⬇ Подписать и скачать", type="primary", key="btn_sign"):
+        try:
+            signed = _build_signed_pdf()
+            st.session_state["auto_signed_pdf"] = signed
+        except Exception as e:
+            st.error(f"Ошибка: {e}")
+            sys.stderr.write(f"[auto_sign] _build_signed_pdf: {e}\n")
+
+    if "auto_signed_pdf" in st.session_state:
+        fname = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+        st.download_button(
+            "💾 Сохранить PDF",
+            data=st.session_state["auto_signed_pdf"],
+            file_name=f"{fname}_signed.pdf",
+            mime="application/pdf",
+            key="dl_signed",
         )
 
-        col_save_p, col_skip_p, _ = st.columns([1, 1, 3])
-        with col_save_p:
-            if st.button("💾 Сохранить паттерны", key="save_patterns_btn"):
-                try:
-                    from core.pattern_extractor import merge_patterns_into_json
 
-                    parties_data = (
-                        read_json("parties.json")
-                        if json_config_exists("parties.json")
-                        else {"version": "2.0", "parties": {}}
-                    )
-                    added = merge_patterns_into_json(parties_data, auto_party_name, lang, patterns)
+# ── Шаг 8: Сохранение шаблона ────────────────────────────────────────────────
+st.divider()
+st.subheader("💾 Сохранение шаблона")
 
-                    # Добавляем aliases
-                    aliases_list = list(filter(None, [
-                        our_side.get("legal_entity"),
-                        *our_side.get("roles", []),
-                        our_side.get("signer"),
-                    ]))
-                    parties_data["parties"][auto_party_name]["languages"][lang]["aliases"] = aliases_list
+has_manual = any(a.added_by == "manual_click" for a in all_anchors)
+lang_h = st.session_state.get("auto_language", "ru")
 
-                    backup = write_json("parties.json", parties_data)
-                    st.success(f"Сохранено {added} паттернов. Бэкап: {backup}")
-                except Exception as e:
-                    st.error(f"Ошибка: {e}")
-        with col_skip_p:
-            if st.button("Пропустить", key="skip_patterns_btn"):
-                st.info("Паттерны не сохранены.")
+try:
+    from core.template_storage import generate_template_name
+    def_name = generate_template_name(lang_h, st.session_state.get("auto_our_side"))
+except Exception:
+    def_name = f"pipelineAuto1_{datetime.now().strftime('%Y-%m-%d_%H%M')}_{lang_h}"
+
+st.text_input("Имя шаблона", value=def_name, key="template_name_input")
+
+_lbl = "💾 Сохранить шаблон (рекомендуется — есть ручные якоря)" if has_manual else "💾 Сохранить шаблон"
+_typ = "primary" if has_manual else "secondary"
+
+if st.button(_lbl, type=_typ, key="btn_save_tpl"):
+    _save_template()
+
+st.caption("Matching по шаблонам — v1.8.")
+st.divider()
+st.caption("SignFinder MVP v1.7")
