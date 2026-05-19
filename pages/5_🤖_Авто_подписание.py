@@ -20,7 +20,7 @@ from uuid import uuid4
 import streamlit as st
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 SUPPORTED_LANGUAGES = ("ru", "en", "pl")
 CANVAS_SCALE = 2.0   # px per pt при рендере страниц
 
