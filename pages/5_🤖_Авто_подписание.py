@@ -577,27 +577,6 @@ current_page: int = st.session_state.get("current_page", 0)
 st.divider()
 st.subheader("2️⃣ Превью и доразметка")
 
-# Пагинация
-nav1, nav2, nav3, nav4 = st.columns([1, 2, 2, 1])
-with nav1:
-    if st.button("◀", key="pg_prev", disabled=(current_page == 0)):
-        st.session_state["current_page"] = current_page - 1
-        st.rerun()
-with nav2:
-    st.markdown(f"**Стр. {current_page + 1}** из {total_pages}")
-with nav3:
-    jump = st.number_input(
-        "Перейти на стр.", min_value=1, max_value=total_pages,
-        value=current_page + 1, label_visibility="collapsed", key="pg_jump",
-    )
-    if jump - 1 != current_page:
-        st.session_state["current_page"] = jump - 1
-        st.rerun()
-with nav4:
-    if st.button("▶", key="pg_next", disabled=(current_page >= total_pages - 1)):
-        st.session_state["current_page"] = current_page + 1
-        st.rerun()
-
 # Якоря текущей страницы + чекбоксы
 page_anchors = _anchors_for_page(all_anchors, current_page, total_pages)
 
@@ -639,6 +618,27 @@ canvas_mode_label = st.radio(
     horizontal=True, key="canvas_mode_radio",
 )
 mode_key = "add" if "Добавить" in canvas_mode_label else "view"
+
+# Пагинация (над превью)
+nav1, nav2, nav3, nav4 = st.columns([1, 2, 2, 1])
+with nav1:
+    if st.button("◀", key="pg_prev", disabled=(current_page == 0)):
+        st.session_state["current_page"] = current_page - 1
+        st.rerun()
+with nav2:
+    st.markdown(f"**Стр. {current_page + 1}** из {total_pages}")
+with nav3:
+    jump = st.number_input(
+        "Перейти на стр.", min_value=1, max_value=total_pages,
+        value=current_page + 1, label_visibility="collapsed", key="pg_jump",
+    )
+    if jump - 1 != current_page:
+        st.session_state["current_page"] = jump - 1
+        st.rerun()
+with nav4:
+    if st.button("▶", key="pg_next", disabled=(current_page >= total_pages - 1)):
+        st.session_state["current_page"] = current_page + 1
+        st.rerun()
 
 # Canvas
 _canvas_ok = False

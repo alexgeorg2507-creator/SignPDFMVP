@@ -34,26 +34,23 @@ if "signature_autoloaded" not in st.session_state:
 
 # ── Загрузка данных подписанта ────────────────────────────────────────────────
 def _load_signer() -> dict:
-    """Читает signer_profile.json или берёт первую сторону из parties.json."""
+    """Читает signer_profile.json — структура: company_aliases / signer_aliases."""
     try:
         if json_config_exists("signer_profile.json"):
-            return read_json("signer_profile.json")
-    except Exception:
-        pass
-    try:
-        if json_config_exists("parties.json"):
-            data = read_json("parties.json")
-            parties = data.get("parties", {})
-            if parties:
-                first_key = next(iter(parties))
-                party = parties[first_key]
-                langs = party.get("languages", {})
-                ru = langs.get("ru", {})
-                aliases = ru.get("aliases", [])
-                return {
-                    "name": aliases[0] if aliases else first_key,
-                    "company": first_key,
-                }
+            sp = read_json("signer_profile.json")
+            # Ищем первый русский алиас, fallback на любой
+            def _first_alias(aliases_list, lang="ru"):
+                for a in (aliases_list or []):
+                    if a.get("language") == lang and a.get("value", "").strip():
+                        return a["value"].split(",")[0].strip()
+                for a in (aliases_list or []):
+                    if a.get("value", "").strip():
+                        return a["value"].split(",")[0].strip()
+                return ""
+            return {
+                "name": _first_alias(sp.get("signer_aliases")),
+                "company": _first_alias(sp.get("company_aliases")),
+            }
     except Exception:
         pass
     return {}
@@ -99,9 +96,10 @@ with col_btn:
     st.write("")
     try:
         if st.button("⚙ Изменить данные"):
+            st.session_state["settings_open_tab"] = "signer"
             st.switch_page("pages/4_⚙️_Настройки.py")
-    except AttributeError:
-        st.info("Раздел: Настройки")
+    except (AttributeError, Exception):
+        st.info("Перейдите в Настройки → вкладка Подписант")
 
 st.divider()
 

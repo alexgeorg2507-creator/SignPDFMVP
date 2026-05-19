@@ -1,5 +1,4 @@
-# SignFinder MVP v1.4.3
-
+# SignFinder MVP v1.7
 # Core dependencies
 streamlit>=1.35.0
 pymupdf>=1.24.0
@@ -9,7 +8,8 @@ anthropic>=0.40.0
 langdetect>=1.0.9
 google-cloud-storage>=2.17.0
 numpy>=1.26.0
-
-# v1.4.3: Template matching (NEW)
+# v1.4.3: Template matching
 simhash>=2.1.2
 streamlit-image-coordinates>=0.1.6
+# v1.7: Canvas drag&drop
+streamlit-drawable-canvas>=0.9.0
