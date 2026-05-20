@@ -1,13 +1,16 @@
 """Наложение PNG-подписи на PDF и опциональный flatten."""
 import io
+import sys
 
 import fitz
 from PIL import Image
 
 
-# Высота подписи: max(MIN_PT, line_height × MULTIPLIER)
+# Высота подписи: max(MIN_PT, line_height × MULTIPLIER), но не больше MAX_PT
 MIN_SIGNATURE_HEIGHT_PT = 30
+MAX_SIGNATURE_HEIGHT_PT = 50         # потолок — защита от аномальных bbox
 LINE_HEIGHT_MULTIPLIER = 3
+MAX_BBOX_HEIGHT_FOR_LINE_PT = 25     # bbox выше этого считаем аномальным
 
 
 def apply_signature(pdf_bytes: bytes, matches: list, png_bytes: bytes, flatten: bool = False) -> bytes:
@@ -21,10 +24,24 @@ def apply_signature(pdf_bytes: bytes, matches: list, png_bytes: bytes, flatten: 
             continue
 
         page = doc[m.page]
-        page_rect = page.rect  # границы страницы
         anchor_x, anchor_y_bottom, line_height = _find_underscore_anchor(page, m.bbox, m.pattern)
 
+        # Sanity: если "line_height" аномально большой (например, bbox якоря 30pt
+        # вместо текстовой строки 12pt) — используем фолбэк 12pt
+        if line_height > MAX_BBOX_HEIGHT_FOR_LINE_PT:
+            sys.stderr.write(
+                f"[overlay] anomalous line_height={line_height:.1f} for match {m.id} "
+                f"(bbox={m.bbox}), clamping to 12pt\n"
+            )
+            line_height = 12.0
+
         sig_h = max(MIN_SIGNATURE_HEIGHT_PT, line_height * LINE_HEIGHT_MULTIPLIER)
+        if sig_h > MAX_SIGNATURE_HEIGHT_PT:
+            sys.stderr.write(
+                f"[overlay] sig_h={sig_h:.1f} capped to {MAX_SIGNATURE_HEIGHT_PT} "
+                f"for match {m.id}\n"
+            )
+            sig_h = MAX_SIGNATURE_HEIGHT_PT
         sig_w = sig_h * aspect
 
         sig_rect = fitz.Rect(
@@ -33,15 +50,6 @@ def apply_signature(pdf_bytes: bytes, matches: list, png_bytes: bytes, flatten: 
             anchor_x + sig_w,
             anchor_y_bottom,
         )
-
-        # Клипаем к границам страницы — иначе fitz растягивает изображение на весь лист
-        sig_rect = sig_rect & page_rect
-
-        # Пропускаем если rect невалидный (нулевая площадь или инвертированный)
-        if sig_rect.is_empty or sig_rect.is_infinite or sig_rect.width < 5 or sig_rect.height < 5:
-            print(f"[overlay] skip match {m.id}: invalid sig_rect {sig_rect}", flush=True)
-            continue
-
         page.insert_image(sig_rect, stream=png_bytes, keep_proportion=True)
 
     out_bytes = doc.tobytes(deflate=True)

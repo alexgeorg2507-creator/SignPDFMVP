@@ -698,7 +698,7 @@ try:
                     if new_a:
                         # bbox принудительно ставим в точку клика
                         # (фиксированный размер подписи ~150×30pt, центрируем по клику)
-                        sw, sh = 150.0, 30.0
+                        sw, sh = 150.0, 12.0
                         new_a.bbox = (
                             click_x_pt - sw / 2,
                             click_y_pt - sh / 2,
@@ -737,7 +737,7 @@ if mode_key == "add" and not _preview_rendered:
                                             st.session_state.get("auto_language", "ru"))
                 _fd.close()
                 if a:
-                    sw, sh = 150.0, 30.0
+                    sw, sh = 150.0, 12.0
                     a.bbox = (mx - sw / 2, my - sh / 2, mx + sw / 2, my + sh / 2)
                     st.session_state["all_anchors"].append(a)
                     st.rerun()

@@ -251,20 +251,27 @@ def _page_hint(page_idx: int, doc) -> str:
 def _signature_bbox_from_position(
     anchor_bbox, position: str, offset_pt: float, signature_height_pt: float
 ) -> tuple[float, float, float, float]:
+    """bbox якоря должен соответствовать текстовой строке (~12pt),
+    overlay сам подберёт высоту подписи через line_height × множитель.
+    Ширину тоже ограничиваем разумным размером подписи.
+    """
     x0, y0, x1, y1 = anchor_bbox
-    w = x1 - x0
-    h = signature_height_pt
+    text_w = x1 - x0
+    # Ширина подписи: разумный максимум, не шире самого якорного текста × 1.5
+    sig_w = min(150.0, max(80.0, text_w * 1.2))
+    # Высота bbox = высота текстовой строки (для корректного множителя в overlay)
+    line_h = min(15.0, max(8.0, y1 - y0))
 
     if position == "right":
-        return (x1 + offset_pt, y0, x1 + offset_pt + w, y0 + h)
+        return (x1 + offset_pt, y0, x1 + offset_pt + sig_w, y0 + line_h)
     if position == "left":
-        return (x0 - offset_pt - w, y0, x0 - offset_pt, y0 + h)
+        return (x0 - offset_pt - sig_w, y0, x0 - offset_pt, y0 + line_h)
     if position == "below":
-        return (x0, y1 + offset_pt, x1, y1 + offset_pt + h)
+        return (x0, y1 + offset_pt, x0 + sig_w, y1 + offset_pt + line_h)
     if position == "above":
-        return (x0, y0 - offset_pt - h, x1, y0 - offset_pt)
+        return (x0, y0 - offset_pt - line_h, x0 + sig_w, y0 - offset_pt)
     # on
-    return (x0, y0, x1, y0 + h)
+    return (x0, y0, x0 + sig_w, y0 + line_h)
 
 
 def _build_anchor(
