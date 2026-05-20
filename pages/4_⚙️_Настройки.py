@@ -3,11 +3,8 @@
 Streamlit multi-page: pages/4_⚙️_Настройки.py
 
 Содержит:
-- parties.json — CRUD-редактор сторон договора
-- corrections.md — база корректировок
-- Промпты — редактирование статичных блоков
-- Подписант — signer_profile.json (v1.5)
-- Маркеры подписи — markers.json (v1.5)
+- parties.json — CRUD-редактор сторон договора (перенесено из 2_Шаблоны)
+- corrections.md — база корректировок (перенесено из expander app.py)
 """
 import json
 
@@ -26,12 +23,11 @@ st.title("⚙️ Настройки SignFinder")
 
 LANGUAGES = ["ru", "en", "pl"]
 
-tab_parties, tab_corrections, tab_prompts, tab_signer, tab_markers = st.tabs([
+tab_parties, tab_corrections, tab_prompts, tab_traffic = st.tabs([
     "📋 Стороны (parties.json)",
     "🔧 Корректировки (corrections.md)",
     "🤖 Промпты",
-    "👤 Подписант",
-    "🔖 Маркеры подписи",
+    "🚦 Светофор шаблонов",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,156 +285,53 @@ with tab_prompts:
                 else:
                     st.success("✓ Дефолтное значение")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ТАБ 4: Подписант (signer_profile.json)
+# ТАБ 4: Светофор шаблонов
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_signer:
-    st.caption("Данные подписанта: компания и ФИО на разных языках. Используются в авто-пайплайне для определения нашей стороны в договоре.")
+with tab_traffic:
+    st.caption("Настройки порогов автоматического применения шаблонов (v1.8)")
 
-    from core.signer_profile import load_signer_profile, save_signer_profile
+    try:
+        from core.traffic_light import load_config, save_config, TrafficLightConfig
+        cfg = load_config()
+    except Exception as e:
+        st.error(f"Ошибка загрузки конфига светофора: {e}")
+        st.stop()
 
-    if "signer_profile_data" not in st.session_state:
-        st.session_state["signer_profile_data"] = load_signer_profile()
-
-    sp = st.session_state["signer_profile_data"]
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def _render_alias_table(alias_list: list, prefix: str) -> list:
-        """Рисует строки алиасов, возвращает обновлённый список."""
-        to_delete = []
-        for i, alias in enumerate(alias_list):
-            c1, c2, c3 = st.columns([2, 6, 1])
-            with c1:
-                opts = LANGUAGES
-                cur_lang = alias.get("language", "ru")
-                idx = opts.index(cur_lang) if cur_lang in opts else 0
-                alias["language"] = st.selectbox(
-                    "Язык",
-                    options=opts,
-                    index=idx,
-                    key=f"{prefix}_lang_{i}",
-                    label_visibility="collapsed",
-                )
-            with c2:
-                alias["value"] = st.text_input(
-                    "Значение",
-                    value=alias.get("value", ""),
-                    key=f"{prefix}_val_{i}",
-                    label_visibility="collapsed",
-                )
-            with c3:
-                if st.button("🗑", key=f"{prefix}_del_{i}"):
-                    to_delete.append(i)
-
-        for idx in sorted(to_delete, reverse=True):
-            alias_list.pop(idx)
-
-        if to_delete:
-            st.rerun()
-
-        return alias_list
-
-    # ── Компания ──────────────────────────────────────────────────────────────
-    st.subheader("Алиасы компании")
-    st.caption("Юридическое название на разных языках. Опционально — можно оставить пустым.")
-
-    if not sp.get("company_aliases"):
-        st.info("Нет алиасов. Добавьте хотя бы один если хотите искать по названию компании.")
-
-    sp["company_aliases"] = _render_alias_table(sp.setdefault("company_aliases", []), "company")
-
-    if st.button("+ Добавить алиас компании", key="company_add"):
-        sp["company_aliases"].append({"language": "ru", "value": ""})
-        st.rerun()
-
-    st.divider()
-
-    # ── ФИО подписанта ────────────────────────────────────────────────────────
-    st.subheader("Алиасы ФИО подписанта")
-    st.caption("Фамилия, Фамилия И.И., Фамилия Имя Отчество — на разных языках. Минимум одно значение.")
-
-    if not sp.get("signer_aliases"):
-        st.warning("⚠️ Не задано ни одного алиаса ФИО. Авто-пайплайн не сможет определить нашу сторону.")
-
-    sp["signer_aliases"] = _render_alias_table(sp.setdefault("signer_aliases", []), "signer")
-
-    if st.button("+ Добавить алиас ФИО", key="signer_add"):
-        sp["signer_aliases"].append({"language": "ru", "value": ""})
-        st.rerun()
-
-    st.divider()
-
-    col_sp_save, col_sp_reload, col_sp_raw = st.columns([1, 1, 2])
-    with col_sp_save:
-        if st.button("💾 Сохранить подписанта", type="primary", key="sp_save"):
-            if not any(a.get("value", "").strip() for a in sp.get("signer_aliases", [])):
-                st.error("Нужен хотя бы один алиас ФИО.")
-            else:
-                try:
-                    backup = save_signer_profile(sp)
-                    st.success(f"Сохранено. Бэкап: {backup}")
-                except Exception as e:
-                    st.error(f"Ошибка: {e}")
-    with col_sp_reload:
-        if st.button("🔄 Перечитать", key="sp_reload"):
-            st.session_state.pop("signer_profile_data", None)
-            st.rerun()
-    with col_sp_raw:
-        with st.expander("Raw JSON", expanded=False):
-            st.code(json.dumps(sp, ensure_ascii=False, indent=2), language="json")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ТАБ 5: Маркеры подписи (markers.json)
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_markers:
-    st.caption("Универсальные маркеры для поиска мест подписи. Служебная настройка — редактируется редко. JSON напрямую.")
-
-    from core.markers import load_markers, save_markers, DEFAULTS as MARKERS_DEFAULTS
-
-    if "markers_data" not in st.session_state:
-        raw = load_markers()
-        st.session_state["markers_raw"] = json.dumps(raw, ensure_ascii=False, indent=2)
-
-    col_m_save, col_m_reset, col_m_reload = st.columns([1, 1, 2])
-
-    with col_m_save:
-        if st.button("💾 Сохранить маркеры", type="primary", key="markers_save"):
-            raw_text = st.session_state.get("markers_editor", "")
-            try:
-                parsed = json.loads(raw_text)
-                backup = save_markers(parsed)
-                st.success(f"Сохранено. Бэкап: {backup}")
-                st.session_state["markers_raw"] = raw_text
-            except json.JSONDecodeError as e:
-                st.error(f"Невалидный JSON: {e}")
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-
-    with col_m_reset:
-        if st.button("↩ Сбросить к дефолтам", key="markers_reset"):
-            default_text = json.dumps(MARKERS_DEFAULTS, ensure_ascii=False, indent=2)
-            st.session_state["markers_raw"] = default_text
-            try:
-                save_markers(MARKERS_DEFAULTS)
-                st.success("Сброшено к дефолтам")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-
-    with col_m_reload:
-        if st.button("🔄 Перечитать", key="markers_reload"):
-            st.session_state.pop("markers_raw", None)
-            st.session_state.pop("markers_data", None)
-            st.rerun()
-
-    st.divider()
-
-    markers_text = st.text_area(
-        "markers.json",
-        value=st.session_state.get("markers_raw", "{}"),
-        height=500,
-        key="markers_editor",
-        label_visibility="collapsed",
+    st.markdown("**Порог зелёного (автоматическое применение)**")
+    new_threshold = st.slider(
+        "Минимальный score для зелёного",
+        min_value=0.5,
+        max_value=1.0,
+        value=float(cfg.green_threshold),
+        step=0.01,
+        format="%.2f",
+        key="tl_threshold",
+        help="При score ≥ этого порога шаблон применяется автоматически (без полного LLM-анализа).",
     )
+
+    new_synonym_required = st.checkbox(
+        "Требовать совпадение синонимов стороны для зелёного",
+        value=bool(cfg.synonym_match_required),
+        key="tl_synonym_req",
+        help="Если синонимы нашей стороны не пересекаются с шаблоном — светофор жёлтый даже при высоком score.",
+    )
+
+    st.caption(
+        f"Текущий конфиг: threshold={cfg.green_threshold}, "
+        f"synonym_required={cfg.synonym_match_required}"
+    )
+
+    if st.button("💾 Сохранить настройки светофора", key="save_tl_btn"):
+        try:
+            new_cfg = TrafficLightConfig(
+                green_threshold=new_threshold,
+                synonym_match_required=new_synonym_required,
+            )
+            save_config(new_cfg)
+            st.success(
+                f"Сохранено: threshold={new_threshold:.2f}, "
+                f"synonym_required={new_synonym_required}"
+            )
+        except Exception as e:
+            st.error(f"Ошибка сохранения: {e}")

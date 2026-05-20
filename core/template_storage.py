@@ -192,6 +192,78 @@ def generate_template_name(language: str, synonyms: Optional[dict] = None) -> st
     return name
 
 
+def update_usage_stats(
+    template_id: str,
+    event: str,  # "applied" | "confirmed" | "rejected"
+) -> None:
+    """Обновляет usage_stats шаблона. event: applied / confirmed / rejected."""
+    tpl = load_template(template_id)
+    if tpl is None:
+        sys.stderr.write(f"[template_storage] update_usage_stats: template {template_id} not found\n")
+        return
+    stats = tpl.usage_stats or {
+        "times_applied": 0, "times_confirmed": 0, "times_rejected": 0, "last_used": None
+    }
+    if event == "applied":
+        stats["times_applied"] = stats.get("times_applied", 0) + 1
+        stats["last_used"] = datetime.now(timezone.utc).isoformat()
+    elif event == "confirmed":
+        stats["times_confirmed"] = stats.get("times_confirmed", 0) + 1
+    elif event == "rejected":
+        stats["times_rejected"] = stats.get("times_rejected", 0) + 1
+    else:
+        sys.stderr.write(f"[template_storage] update_usage_stats: unknown event '{event}'\n")
+        return
+    tpl.usage_stats = stats
+    try:
+        save_template(tpl)
+    except Exception as e:
+        logger.error("update_usage_stats save failed: %s", e)
+        sys.stderr.write(f"[template_storage] update_usage_stats save: {e}\n")
+
+
+def add_anchors_to_template(
+    template_id: str,
+    new_anchors: list,
+    increment_version: bool = False,
+) -> Optional[str]:
+    """
+    Добавляет якоря к шаблону.
+    increment_version=True → создаёт новую запись с суффиксом _v2/_v3/...
+    Возвращает template_id (существующий или новый).
+    """
+    tpl = load_template(template_id)
+    if tpl is None:
+        sys.stderr.write(f"[template_storage] add_anchors_to_template: template {template_id} not found\n")
+        return None
+    if increment_version:
+        # Определяем новую версию
+        base = tpl.name
+        import re as _re
+        m = _re.search(r"_v(\d+)$", base)
+        if m:
+            ver = int(m.group(1)) + 1
+            new_name = base[:m.start()] + f"_v{ver}"
+        else:
+            new_name = base + "_v2"
+        new_tpl = DocumentTemplate(
+            template_id=uuid4().hex,
+            name=new_name,
+            language=tpl.language,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            created_by="manual_enrichment",
+            fingerprint=tpl.fingerprint,
+            anchors=tpl.anchors + new_anchors,
+            synonyms_used=tpl.synonyms_used,
+        )
+        save_template(new_tpl)
+        return new_tpl.template_id
+    else:
+        tpl.anchors = tpl.anchors + new_anchors
+        save_template(tpl)
+        return tpl.template_id
+
+
 def new_template(
     language: str,
     anchors: list,
