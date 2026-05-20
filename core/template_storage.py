@@ -157,7 +157,6 @@ def delete_template(template_id: str) -> bool:
             blob = bucket.blob(_blob_path(template_id))
             if not blob.exists():
                 return False
-            # бэкап
             content = blob.download_as_text()
             bucket.blob(_archive_blob_path(template_id)).upload_from_string(
                 content, content_type="application/json"
@@ -178,10 +177,7 @@ def delete_template(template_id: str) -> bool:
 
 
 def generate_template_name(language: str, synonyms: Optional[dict] = None) -> str:
-    """
-    Имя по схеме: pipelineAuto1_YYYY-MM-DD_HHMM_<lang>[_<тип>]
-    synonyms может содержать ключ 'doc_type' для суффикса.
-    """
+    """Имя по схеме: pipelineAuto1_YYYY-MM-DD_HHMM_<lang>[_<тип>]"""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     name = f"pipelineAuto1_{ts}_{language}"
     if synonyms:
@@ -211,3 +207,115 @@ def new_template(
         anchors=anchors,
         synonyms_used=synonyms_used,
     )
+
+
+# ── v1.8: статистика и расширение якорей ─────────────────────────────────────
+
+def update_usage_stats(
+    template_id: str,
+    event: str,  # "applied" | "confirmed" | "rejected"
+) -> None:
+    """Обновляет статистику использования шаблона.
+
+    applied:   times_applied++, last_used = now
+    confirmed: times_confirmed++
+    rejected:  times_rejected++
+    """
+    template = load_template(template_id)
+    if template is None:
+        sys.stderr.write(f"[template_storage] update_usage_stats: {template_id} not found\n")
+        return
+
+    stats = template.usage_stats or {
+        "times_applied": 0,
+        "times_confirmed": 0,
+        "times_rejected": 0,
+        "last_used": None,
+    }
+
+    if event == "applied":
+        stats["times_applied"] = stats.get("times_applied", 0) + 1
+        stats["last_used"] = datetime.now(timezone.utc).isoformat()
+    elif event == "confirmed":
+        stats["times_confirmed"] = stats.get("times_confirmed", 0) + 1
+    elif event == "rejected":
+        stats["times_rejected"] = stats.get("times_rejected", 0) + 1
+    else:
+        sys.stderr.write(f"[template_storage] update_usage_stats: unknown event '{event}'\n")
+        return
+
+    template.usage_stats = stats
+    try:
+        save_template(template)
+    except Exception as e:
+        sys.stderr.write(f"[template_storage] update_usage_stats save: {e}\n")
+
+
+def add_anchors_to_template(
+    template_id: str,
+    new_anchors: list,
+    increment_version: bool = False,
+) -> Optional[str]:
+    """Добавляет якоря к существующему шаблону.
+
+    increment_version=False: обновляет шаблон на месте.
+    increment_version=True:  создаёт новую запись с суффиксом _v2, _v3 и т.д.
+    Возвращает template_id (старый или новый).
+    """
+    import re as _re
+
+    template = load_template(template_id)
+    if template is None:
+        sys.stderr.write(f"[template_storage] add_anchors_to_template: {template_id} not found\n")
+        return None
+
+    def _anchor_id(a):
+        return a.get("id") if isinstance(a, dict) else getattr(a, "id", None)
+
+    def _to_dict(a):
+        return a if isinstance(a, dict) else asdict(a)
+
+    if not increment_version:
+        existing_ids = {_anchor_id(a) for a in template.anchors}
+        for anchor in new_anchors:
+            d = _to_dict(anchor)
+            if _anchor_id(d) not in existing_ids:
+                template.anchors.append(d)
+                existing_ids.add(_anchor_id(d))
+        try:
+            save_template(template)
+        except Exception as e:
+            sys.stderr.write(f"[template_storage] add_anchors_to_template save: {e}\n")
+            return None
+        return template_id
+
+    # Новая версия: ищем незанятый суффикс _vN
+    base_name = _re.sub(r"_v\d+$", "", template.name)
+    existing_names = {t.name for t in list_templates(template.language)}
+    version = 2
+    while f"{base_name}_v{version}" in existing_names:
+        version += 1
+
+    all_anchors = list(template.anchors)
+    existing_ids = {_anchor_id(a) for a in all_anchors}
+    for anchor in new_anchors:
+        d = _to_dict(anchor)
+        if _anchor_id(d) not in existing_ids:
+            all_anchors.append(d)
+            existing_ids.add(_anchor_id(d))
+
+    new_tpl = DocumentTemplate(
+        template_id=uuid4().hex,
+        name=f"{base_name}_v{version}",
+        language=template.language,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        created_by="manual_enrichment",
+        fingerprint=template.fingerprint,
+        anchors=all_anchors,
+        synonyms_used=template.synonyms_used,
+    )
+    try:
+        return save_template(new_tpl)
+    except Exception as e:
+        sys.stderr.write(f"[template_storage] add_anchors_to_template new version: {e}\n")
+        return None

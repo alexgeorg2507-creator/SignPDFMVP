@@ -1,10 +1,11 @@
-"""Авто-подписание договоров — SignFinder v1.7.
+"""Авто-подписание договоров — SignFinder v1.8.
 
-Флоу:
-  1-5. pipelineAuto1 (без изменений)
+Флоу v1.8:
+  0.   Матчинг по реестру шаблонов (🟢/🟡 светофор)
+  1-5. pipelineAuto1 — запускается только при жёлтом свете
   6.   Конвертация matches → TextAnchor, пагинация, canvas, ручная доразметка
   7.   Наложение подписи + скачивание
-  8.   Сохранение шаблона
+  8.   Сохранение шаблона (с диалогом обновления/новой версии)
 """
 import copy
 import io
@@ -275,7 +276,7 @@ def _build_debug_export() -> dict:
     patterns = st.session_state.get("auto_patterns") or []
     matches = st.session_state.get("auto_matches") or []
     return {
-        "version": "1.7",
+        "version": "1.8",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "doc_info": {
             "filename": st.session_state.get("auto_doc_name", ""),
@@ -304,6 +305,9 @@ def _reset_pipeline():
         "auto_language", "auto_our_side", "auto_patterns", "auto_matches",
         "auto_signed_pdf", "all_anchors", "fingerprint", "current_page",
         "debug_prompt_step3", "debug_raw_step3", "debug_prompt_step4", "debug_raw_step4",
+        # v1.8
+        "matcher_result", "traffic_light", "run_full_pipeline",
+        "apply_template_confirmed", "applied_template_id",
     ]:
         st.session_state.pop(k, None)
 
@@ -477,20 +481,157 @@ def _save_template():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v1.8: Новые helper-функции — матчер UI + применение шаблона
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_template_anchors_to_session(template_id: str) -> bool:
+    """Загружает шаблон, применяет якоря к doc, записывает в session_state."""
+    try:
+        from core.template_storage import load_template, update_usage_stats
+        from core.finder import apply_template_anchors, regex_match_to_anchor
+
+        doc = st.session_state["auto_doc"]
+        lang = st.session_state.get("auto_language", "ru")
+
+        template = load_template(template_id)
+        if template is None:
+            st.error(f"Шаблон {template_id[:8]}… не найден в реестре.")
+            return False
+
+        matches = apply_template_anchors(doc, template)
+        anchors = []
+        for m in matches:
+            try:
+                anchors.append(regex_match_to_anchor(m, m.page, lang))
+            except Exception as e:
+                sys.stderr.write(f"[auto_sign] template anchor conv: {e}\n")
+
+        if not anchors:
+            st.warning("Шаблон найден, но якоря не применились. Попробуйте полный анализ.")
+            return False
+
+        st.session_state["all_anchors"] = anchors
+        st.session_state["current_page"] = 0
+        st.session_state["applied_template_id"] = template_id
+
+        try:
+            update_usage_stats(template_id, "applied")
+        except Exception as e:
+            sys.stderr.write(f"[auto_sign] update_usage_stats: {e}\n")
+
+        return True
+    except Exception as e:
+        st.error(f"Ошибка применения шаблона: {e}")
+        sys.stderr.write(f"[auto_sign] _apply_template_anchors_to_session: {e}\n")
+        return False
+
+
+def _show_green_light_ui(match) -> None:
+    """UI для зелёного светофора — предложение применить шаблон."""
+    st.success("🟢 Найден похожий шаблон")
+    with st.container(border=True):
+        pct = int(match.score * 100)
+        st.markdown(f"**«{match.template_name}»** (совпадение {pct}%)")
+        for line in match.explanation.split(". "):
+            line = line.strip().rstrip(".")
+            if not line:
+                continue
+            icon = "⚠" if "⚠" in line or "отличается" in line else "✓"
+            st.caption(f"{icon} {line}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶ Применить шаблон автоматически", type="primary",
+                         key="btn_apply_green"):
+                st.session_state["apply_template_confirmed"] = match.template_id
+                st.rerun()
+        with col2:
+            if st.button("✗ Не применять, запустить полный анализ",
+                         key="btn_skip_green"):
+                st.session_state["run_full_pipeline"] = True
+                st.rerun()
+
+
+def _show_yellow_light_ui(matcher_result) -> None:
+    """UI для жёлтого светофора — с кандидатом, коллизией или без матча."""
+    candidates = matcher_result.all_candidates
+
+    # Коллизия: два кандидата с разницей score < 0.05
+    if (len(candidates) >= 2 and
+            (candidates[0].score - candidates[1].score) < 0.05):
+        st.warning("🟡 Найдено несколько похожих шаблонов")
+        with st.container(border=True):
+            for c in candidates[:3]:
+                st.caption(f"«{c.template_name}» — {int(c.score * 100)}%")
+            st.caption("Рекомендуется запустить полный анализ.")
+            btns = st.columns(min(len(candidates[:3]) + 1, 4))
+            with btns[0]:
+                if st.button("▶ Полный анализ", type="primary",
+                             key="btn_full_collision"):
+                    st.session_state["run_full_pipeline"] = True
+                    st.rerun()
+            for i, c in enumerate(candidates[:3], 1):
+                if i < len(btns):
+                    with btns[i]:
+                        short = c.template_name[:14]
+                        if st.button(f"Использовать {short}",
+                                     key=f"btn_use_{c.template_id}"):
+                            st.session_state["apply_template_confirmed"] = c.template_id
+                            st.rerun()
+        return
+
+    # Жёлтый с одним кандидатом
+    if candidates:
+        best = candidates[0]
+        st.warning("🟡 Найден похожий шаблон, но есть отличия")
+        with st.container(border=True):
+            pct = int(best.score * 100)
+            st.markdown(f"**«{best.template_name}»** (совпадение {pct}%)")
+            for line in best.explanation.split(". "):
+                line = line.strip().rstrip(".")
+                if not line:
+                    continue
+                icon = "⚠" if "⚠" in line or "отличается" in line else "✓"
+                st.caption(f"{icon} {line}")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("▶ Применить шаблон с проверкой",
+                             key="btn_apply_yellow"):
+                    st.session_state["apply_template_confirmed"] = best.template_id
+                    st.rerun()
+            with c2:
+                if st.button("▶ Запустить полный анализ", type="primary",
+                             key="btn_full_yellow"):
+                    st.session_state["run_full_pipeline"] = True
+                    st.rerun()
+            if len(candidates) > 1:
+                with c3:
+                    with st.expander(f"Все кандидаты ({len(candidates)})"):
+                        for c in candidates:
+                            st.caption(f"«{c.template_name}» — {int(c.score * 100)}%")
+    else:
+        # Жёлтый без кандидатов
+        st.info("📄 Похожих шаблонов в реестре нет. Запускаю полный анализ...")
+        st.session_state["run_full_pipeline"] = True
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.title("🤖 Авто-подписание")
 st.caption("Загрузи договор — система найдёт места подписи. Дорисуй если нужно → скачай PDF.")
 
-# ── Шаги 1-5: загрузка + пайплайн ────────────────────────────────────────────
+# ── Шаги 1-2 + Шаг 0 (v1.8): загрузка + матчер ──────────────────────────────
 uploaded = st.file_uploader("Загрузить договор", type=["pdf", "docx"], key="auto_uploader")
 
 if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.name:
     _reset_pipeline()
     st.session_state["auto_doc_name"] = uploaded.name
 
-    with st.status("Запускаю пайплайн...", expanded=True) as status:
+    with st.status("Анализирую документ...", expanded=True) as status:
 
         st.write("📄 Шаг 1: Парсинг...")
         from core.parser import parse_document
@@ -512,6 +653,75 @@ if uploaded is not None and st.session_state.get("auto_doc_name") != uploaded.na
             st.stop()
         st.session_state["auto_language"] = lang
         st.write(f"✅ Язык: **{lang}**")
+
+        # ── Шаг 0 (v1.8): Поиск похожего шаблона ────────────────────────────
+        st.write("🔎 Шаг 0: Поиск похожего шаблона в реестре...")
+        try:
+            import fitz as _fitz
+            from core.template_matcher import find_matching_templates, log_matching_decision
+            from core.fingerprint import compute_fingerprint
+
+            _fitz_doc = _fitz.open(stream=doc.pdf_bytes, filetype="pdf")
+            try:
+                fp = compute_fingerprint(_fitz_doc, lang)
+                st.session_state["fingerprint"] = fp
+                matcher_result = find_matching_templates(_fitz_doc, lang, fingerprint=fp)
+            finally:
+                _fitz_doc.close()
+
+            st.session_state["matcher_result"] = matcher_result
+            st.session_state["traffic_light"] = matcher_result.traffic_light
+            log_matching_decision(matcher_result, uploaded.name)
+
+            if matcher_result.traffic_light == "green" and matcher_result.best_match:
+                bm = matcher_result.best_match
+                st.write(f"🟢 Найден шаблон: «{bm.template_name}» ({int(bm.score * 100)}%)")
+            elif matcher_result.best_match:
+                bm = matcher_result.best_match
+                st.write(f"🟡 Похожий шаблон ({int(bm.score * 100)}%), требует проверки")
+            else:
+                st.write("🟡 Похожих шаблонов нет — потребуется полный анализ")
+        except Exception as e:
+            sys.stderr.write(f"[auto_sign] matcher step0: {e}\n")
+            st.write(f"⚠️ Матчинг недоступен: {e}")
+            # fallback: сразу в полный пайплайн
+            st.session_state["run_full_pipeline"] = True
+
+        status.update(label="✅ Документ проанализирован", state="complete")
+
+
+# ── v1.8: Светофор UI ─────────────────────────────────────────────────────────
+if (
+    "matcher_result" in st.session_state
+    and "all_anchors" not in st.session_state
+    and not st.session_state.get("run_full_pipeline")
+    and not st.session_state.get("apply_template_confirmed")
+):
+    mr = st.session_state["matcher_result"]
+    if mr.traffic_light == "green" and mr.best_match:
+        _show_green_light_ui(mr.best_match)
+    else:
+        _show_yellow_light_ui(mr)
+
+
+# ── v1.8: Применение шаблона ─────────────────────────────────────────────────
+if st.session_state.get("apply_template_confirmed") and "all_anchors" not in st.session_state:
+    tid = st.session_state["apply_template_confirmed"]
+    with st.spinner("Применяю шаблон..."):
+        ok = _apply_template_anchors_to_session(tid)
+    if not ok:
+        st.warning("Шаблон не применился. Запускаю полный анализ...")
+        st.session_state["run_full_pipeline"] = True
+        st.session_state.pop("apply_template_confirmed", None)
+        st.rerun()
+
+
+# ── v1.8: Полный пайплайн (шаги 3-5) — запускается при жёлтом свете ──────────
+if st.session_state.get("run_full_pipeline") and "all_anchors" not in st.session_state:
+    doc = st.session_state["auto_doc"]
+    lang = st.session_state["auto_language"]
+
+    with st.status("Запускаю полный анализ...", expanded=True) as status:
 
         st.write("🔍 Шаг 3: Наша сторона...")
         our_side = _run_step3(doc, lang)
@@ -619,7 +829,7 @@ canvas_mode_label = st.radio(
 )
 mode_key = "add" if "Добавить" in canvas_mode_label else "view"
 
-# Пагинация (над превью) — number_input с динамическим ключом, чтобы не конфликтовать с кнопками
+# Пагинация (над превью) — number_input с динамическим ключом
 nav1, nav2, nav3, nav4 = st.columns([1, 2, 2, 1])
 with nav1:
     if st.button("◀", key="pg_prev", disabled=(current_page == 0)):
@@ -628,8 +838,6 @@ with nav1:
 with nav2:
     st.markdown(f"**Стр. {current_page + 1}** из {total_pages}")
 with nav3:
-    # Динамический ключ — пересоздаём виджет при смене current_page,
-    # чтобы он не «помнил» старое значение и не откатывал обратно
     jump = st.number_input(
         "Перейти на стр.",
         min_value=1, max_value=total_pages,
@@ -664,13 +872,11 @@ try:
     img_bytes = render_page_with_highlights(doc.pdf_bytes, current_page, pm, scale=1.5)
 
     if mode_key == "add":
-        # Кликабельное превью — клик добавляет якорь
         from streamlit_image_coordinates import streamlit_image_coordinates
         from PIL import Image
 
         pil_img = Image.open(io.BytesIO(img_bytes))
-        img_w, img_h = pil_img.size
-        click_scale = 1.5  # scale при рендере превью
+        click_scale = 1.5
 
         coords = streamlit_image_coordinates(
             pil_img,
@@ -681,7 +887,6 @@ try:
             click_x_pt = coords["x"] / click_scale
             click_y_pt = coords["y"] / click_scale
 
-            # Проверка: не обработали ли мы этот клик уже
             last_click = st.session_state.get("_last_click")
             this_click = (current_page, round(click_x_pt, 1), round(click_y_pt, 1))
             if last_click != this_click:
@@ -696,8 +901,6 @@ try:
                     )
                     _fd.close()
                     if new_a:
-                        # bbox принудительно ставим в точку клика
-                        # (фиксированный размер подписи ~150×30pt, центрируем по клику)
                         sw, sh = 150.0, 12.0
                         new_a.bbox = (
                             click_x_pt - sw / 2,
@@ -712,7 +915,6 @@ try:
                 except Exception as e:
                     st.error(f"Ошибка добавления: {e}")
     else:
-        # Режим просмотра — статичное превью
         st.image(img_bytes, use_container_width=True)
 
     _preview_rendered = True
@@ -797,9 +999,35 @@ st.text_input("Имя шаблона", value=def_name, key="template_name_input"
 _lbl = "💾 Сохранить шаблон (рекомендуется — есть ручные якоря)" if has_manual else "💾 Сохранить шаблон"
 _typ = "primary" if has_manual else "secondary"
 
+# v1.8: диалог обновления/версионирования при применении шаблона + ручных якорях
+applied_tid = st.session_state.get("applied_template_id")
+if applied_tid and has_manual:
+    st.info("Шаблон был расширен новыми якорями. Что делать с изменениями?")
+    vc1, vc2, vc3 = st.columns(3)
+    with vc1:
+        if st.button("💾 Обновить существующий шаблон", key="btn_upd_tpl"):
+            try:
+                from core.template_storage import add_anchors_to_template
+                manual_anchors = [asdict(a) for a in all_anchors if a.added_by == "manual_click"]
+                add_anchors_to_template(applied_tid, manual_anchors, increment_version=False)
+                st.success("Шаблон обновлён.")
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+    with vc2:
+        if st.button("🆕 Создать новую версию", key="btn_new_ver"):
+            try:
+                from core.template_storage import add_anchors_to_template
+                manual_anchors = [asdict(a) for a in all_anchors if a.added_by == "manual_click"]
+                new_id = add_anchors_to_template(applied_tid, manual_anchors, increment_version=True)
+                st.success(f"Создана новая версия: {new_id[:8]}…")
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+    with vc3:
+        if st.button("✗ Не сохранять", key="btn_no_save_ver"):
+            st.session_state.pop("applied_template_id", None)
+            st.rerun()
+
 if st.button(_lbl, type=_typ, key="btn_save_tpl"):
     _save_template()
 
-st.caption("Matching по шаблонам — v1.8.")
-st.divider()
-st.caption("SignFinder MVP v1.7")
+st.caption("SignFinder MVP v1.8")
