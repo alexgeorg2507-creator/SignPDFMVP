@@ -619,25 +619,30 @@ canvas_mode_label = st.radio(
 )
 mode_key = "add" if "Добавить" in canvas_mode_label else "view"
 
-# Пагинация (над превью)
+# Пагинация (над превью) — number_input с динамическим ключом, чтобы не конфликтовать с кнопками
 nav1, nav2, nav3, nav4 = st.columns([1, 2, 2, 1])
 with nav1:
     if st.button("◀", key="pg_prev", disabled=(current_page == 0)):
-        st.session_state["current_page"] = current_page - 1
+        st.session_state["current_page"] = max(0, current_page - 1)
         st.rerun()
 with nav2:
     st.markdown(f"**Стр. {current_page + 1}** из {total_pages}")
 with nav3:
+    # Динамический ключ — пересоздаём виджет при смене current_page,
+    # чтобы он не «помнил» старое значение и не откатывал обратно
     jump = st.number_input(
-        "Перейти на стр.", min_value=1, max_value=total_pages,
-        value=current_page + 1, label_visibility="collapsed", key="pg_jump",
+        "Перейти на стр.",
+        min_value=1, max_value=total_pages,
+        value=current_page + 1,
+        label_visibility="collapsed",
+        key=f"pg_jump_{current_page}",
     )
     if jump - 1 != current_page:
         st.session_state["current_page"] = jump - 1
         st.rerun()
 with nav4:
     if st.button("▶", key="pg_next", disabled=(current_page >= total_pages - 1)):
-        st.session_state["current_page"] = current_page + 1
+        st.session_state["current_page"] = min(total_pages - 1, current_page + 1)
         st.rerun()
 
 # Превью страницы с подсветкой якорей
@@ -691,6 +696,15 @@ try:
                     )
                     _fd.close()
                     if new_a:
+                        # bbox принудительно ставим в точку клика
+                        # (фиксированный размер подписи ~150×30pt, центрируем по клику)
+                        sw, sh = 150.0, 30.0
+                        new_a.bbox = (
+                            click_x_pt - sw / 2,
+                            click_y_pt - sh / 2,
+                            click_x_pt + sw / 2,
+                            click_y_pt + sh / 2,
+                        )
                         st.session_state["all_anchors"].append(new_a)
                         st.rerun()
                     else:
@@ -723,6 +737,8 @@ if mode_key == "add" and not _preview_rendered:
                                             st.session_state.get("auto_language", "ru"))
                 _fd.close()
                 if a:
+                    sw, sh = 150.0, 30.0
+                    a.bbox = (mx - sw / 2, my - sh / 2, mx + sw / 2, my + sh / 2)
                     st.session_state["all_anchors"].append(a)
                     st.rerun()
                 else:
