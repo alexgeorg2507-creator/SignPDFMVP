@@ -603,41 +603,72 @@ def _render_debug_export_block() -> None:
         st.caption(
             "Полный JSON со всем состоянием обработки: doc, fingerprint, matcher, "
             "applied_template, pipeline (step3-5), matches→anchors mapping, "
-            "all_anchors, parties.json. Используется для диагностики проблем "
-            "первичной расстановки подписей и применения шаблонов."
+            "all_anchors, parties.json."
         )
+
+        # 1. Собрать данные
         try:
             from core.debug_export import build_debug_export
             export_data = build_debug_export(st.session_state)
+        except Exception as e:
+            st.error(f"Не удалось собрать экспорт: {e}")
+            sys.stderr.write(f"[auto_sign] build_debug_export: {e}\n")
+            return
 
-            # Краткая сводка прямо в UI
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Страниц", export_data.get("doc_info", {}).get("pages", 0))
-            c2.metric("Светофор", export_data.get("matcher", {}).get("traffic_light") or "—")
-            c3.metric("Matches", export_data.get("matches_to_anchors_mapping", {}).get("matches_count", 0))
-            c4.metric("Якорей", export_data.get("all_anchors", {}).get("total", 0))
+        # 2. Сводка метрик
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Страниц", export_data.get("doc_info", {}).get("pages", 0))
+        c2.metric("Светофор", export_data.get("matcher", {}).get("traffic_light") or "—")
+        c3.metric("Matches", export_data.get("matches_to_anchors_mapping", {}).get("matches_count", 0))
+        c4.metric("Якорей", export_data.get("all_anchors", {}).get("total", 0))
 
-            mapping = export_data.get("matches_to_anchors_mapping", {})
-            lost = mapping.get("lost_matches_count", 0)
-            orphans = mapping.get("orphan_anchors_count", 0)
-            if lost:
-                st.error(f"⚠️ Потеряно match→anchor: {lost} (см. mapping в JSON)")
-            if orphans:
-                st.info(f"ℹ️ Якорей без исходного match: {orphans} (ручная доразметка или шаблон)")
+        mapping = export_data.get("matches_to_anchors_mapping", {})
+        lost = mapping.get("lost_matches_count", 0)
+        orphans = mapping.get("orphan_anchors_count", 0)
+        if lost:
+            st.error(f"⚠️ Потеряно match→anchor: {lost} (см. mapping в JSON)")
+        if orphans:
+            st.info(f"ℹ️ Якорей без исходного match: {orphans} (ручная доразметка или шаблон)")
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+        # 3. Сериализация — defensive (default=str чтобы не падать на edge-cases)
+        try:
+            json_str = json.dumps(export_data, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            st.error(f"Сериализация JSON упала: {e}")
+            sys.stderr.write(f"[auto_sign] json.dumps failed: {e}\n")
+            st.code(repr(export_data)[:10000], language="python")
+            return
+
+        size_kb = len(json_str.encode("utf-8")) / 1024
+        st.caption(f"Размер: **{size_kb:.1f} KB**")
+
+        # 4. Имя файла — sanitize кириллицу, иначе Streamlit/браузер отдаёт UUID.txt
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+        safe_base = re.sub(r"[^A-Za-z0-9_-]", "_", base)[:60].strip("_") or "doc"
+        filename = f"signfinder_debug_{safe_base}_{ts}.json"
+
+        dc1, dc2 = st.columns([2, 2])
+        with dc1:
             st.download_button(
-                "📥 Скачать диагностический JSON",
-                data=json.dumps(export_data, ensure_ascii=False, indent=2),
-                file_name=f"signfinder_debug_{base}_{ts}.json",
+                "📥 Скачать JSON",
+                data=json_str.encode("utf-8"),  # bytes надёжнее str
+                file_name=filename,
                 mime="application/json",
                 key="dl_debug",
                 type="primary",
+                use_container_width=True,
             )
-        except Exception as e:
-            st.error(f"Не удалось собрать экспорт: {e}")
-            sys.stderr.write(f"[auto_sign] _render_debug_export_block: {e}\n")
+        with dc2:
+            st.toggle(
+                "📋 Показать как текст (для копирования)",
+                key="dbg_show_text",
+            )
+
+        # 5. Fallback — если скачивание не работает, можно скопировать вручную
+        if st.session_state.get("dbg_show_text"):
+            st.caption("Выделите всё в блоке ниже (клик в блок → Ctrl+A → Ctrl+C):")
+            st.code(json_str, language="json")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
