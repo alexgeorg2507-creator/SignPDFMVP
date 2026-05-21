@@ -270,36 +270,6 @@ def _run_step5(doc, our_side: dict, patterns: List[str]):
     return matches
 
 
-def _build_debug_export() -> dict:
-    doc = st.session_state.get("auto_doc")
-    our_side = st.session_state.get("auto_our_side") or {}
-    patterns = st.session_state.get("auto_patterns") or []
-    matches = st.session_state.get("auto_matches") or []
-    return {
-        "version": "1.8",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "doc_info": {
-            "filename": st.session_state.get("auto_doc_name", ""),
-            "pages": len(doc.pages) if doc else 0,
-            "language": st.session_state.get("auto_language", ""),
-        },
-        "step3": {
-            **{k: our_side.get(k, "") for k in ("legal_entity", "roles", "signer", "confidence", "match_reason")},
-            "prompt": st.session_state.get("debug_prompt_step3", ""),
-            "raw": st.session_state.get("debug_raw_step3", ""),
-        },
-        "step4": {
-            "patterns": patterns,
-            "prompt": st.session_state.get("debug_prompt_step4", ""),
-            "raw": st.session_state.get("debug_raw_step4", ""),
-        },
-        "step5": {
-            "total": len(matches),
-            "matches": [{"id": m.id, "page": m.page, "bbox": list(m.bbox), "pattern": m.pattern} for m in matches],
-        },
-    }
-
-
 def _reset_pipeline():
     for k in [
         "auto_language", "auto_our_side", "auto_patterns", "auto_matches",
@@ -618,6 +588,59 @@ def _show_yellow_light_ui(matcher_result) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v1.8: Диагностический экспорт
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_debug_export_block() -> None:
+    """Блок с экспортом полного диагностического JSON.
+    Видим всегда когда документ загружен (после загрузки, не зависит от того
+    дошёл ли пайплайн до конца). Для диагностики регрессии v1.7-1.8.
+    """
+    if not st.session_state.get("auto_doc"):
+        return
+
+    with st.expander("🔬 Диагностический экспорт", expanded=False):
+        st.caption(
+            "Полный JSON со всем состоянием обработки: doc, fingerprint, matcher, "
+            "applied_template, pipeline (step3-5), matches→anchors mapping, "
+            "all_anchors, parties.json. Используется для диагностики проблем "
+            "первичной расстановки подписей и применения шаблонов."
+        )
+        try:
+            from core.debug_export import build_debug_export
+            export_data = build_debug_export(st.session_state)
+
+            # Краткая сводка прямо в UI
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Страниц", export_data.get("doc_info", {}).get("pages", 0))
+            c2.metric("Светофор", export_data.get("matcher", {}).get("traffic_light") or "—")
+            c3.metric("Matches", export_data.get("matches_to_anchors_mapping", {}).get("matches_count", 0))
+            c4.metric("Якорей", export_data.get("all_anchors", {}).get("total", 0))
+
+            mapping = export_data.get("matches_to_anchors_mapping", {})
+            lost = mapping.get("lost_matches_count", 0)
+            orphans = mapping.get("orphan_anchors_count", 0)
+            if lost:
+                st.error(f"⚠️ Потеряно match→anchor: {lost} (см. mapping в JSON)")
+            if orphans:
+                st.info(f"ℹ️ Якорей без исходного match: {orphans} (ручная доразметка или шаблон)")
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
+            st.download_button(
+                "📥 Скачать диагностический JSON",
+                data=json.dumps(export_data, ensure_ascii=False, indent=2),
+                file_name=f"signfinder_debug_{base}_{ts}.json",
+                mime="application/json",
+                key="dl_debug",
+                type="primary",
+            )
+        except Exception as e:
+            st.error(f"Не удалось собрать экспорт: {e}")
+            sys.stderr.write(f"[auto_sign] _render_debug_export_block: {e}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -763,17 +786,8 @@ if st.session_state.get("run_full_pipeline") and "all_anchors" not in st.session
         status.update(label="✅ Готово", state="complete")
 
 
-if any(st.session_state.get(k) for k in ("debug_prompt_step3", "auto_our_side")):
-    with st.expander("Debug JSON", expanded=False):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = st.session_state.get("auto_doc_name", "doc").rsplit(".", 1)[0]
-        st.download_button(
-            "📥 Экспорт debug JSON",
-            data=json.dumps(_build_debug_export(), ensure_ascii=False, indent=2),
-            file_name=f"debug_{base}_{ts}.json",
-            mime="application/json",
-            key="dl_debug",
-        )
+# ── Диагностический экспорт (всегда видим после загрузки документа) ──────────
+_render_debug_export_block()
 
 if "all_anchors" not in st.session_state:
     st.stop()
