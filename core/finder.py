@@ -9,6 +9,13 @@ v1.3:
   - умный bbox для матчей с подчёркиваниями: якорное слово + ближайшая линия
     (раньше fallback ставил красный бокс только на слово "Подпись", теперь
     bbox охватывает и слово, и реальную линию подписи)
+
+v1.8.1 (фикс регрессии v1.6→v1.7-1.8):
+  - детекция колонтитулов в _filter_by_dominant_patterns: паттерн срабатывающий
+    на ≥80% страниц И с одинаковыми bbox координатами (±20pt) считается
+    колонтитулом и исключается из результатов целиком. Решает кейс когда
+    «Клиент ___» в шапке каждой страницы выигрывал доминирование над
+    реальным местом подписи «_____ Лебедев А.П.» в реквизитах.
 """
 import re
 import sys
@@ -122,6 +129,10 @@ MAX_BBOX_HEIGHT_PT = 60.0
 # Дедупликация по строке: bbox-ы с центрами по Y ближе этого порога
 # и пересечением по X считаются одним местом подписи.
 SAME_ROW_Y_TOLERANCE_PT = 6.0
+
+# v1.8.1: детекция колонтитулов в _filter_by_dominant_patterns
+COLONTITUL_PAGE_THRESHOLD = 0.8     # ≥80% страниц = подозрение на колонтитул
+COLONTITUL_BBOX_TOLERANCE_PT = 20.0  # ±20pt по каждой координате = «то же место»
 
 
 def _extract_anchor_words(matched_text: str) -> list[str]:
@@ -285,17 +296,73 @@ def _bbox_contains_signature_line(page, match_rect) -> bool:
     return False
 
 
-def _filter_by_dominant_patterns(matches: list[SignMatch], min_pages: int = 2) -> list[SignMatch]:
+def _is_colontitul_pattern(matches_of_pattern: list, total_pages: int) -> bool:
+    """v1.8.1: Определяет является ли паттерн колонтитулом — повторяющейся
+    шапкой/футером на ≥80% страниц документа с практически идентичными bbox.
+
+    Колонтитулы (например 'Клиент ___ Представитель ___' в шапке каждой страницы)
+    не являются местами подписи и должны исключаться. Без этой проверки они
+    выигрывали в _filter_by_dominant_patterns и подавляли реальные подписи
+    в блоке реквизитов на последней странице.
+    """
+    if total_pages < 2 or len(matches_of_pattern) < 2:
+        return False
+
+    pages_covered = {m.page for m in matches_of_pattern}
+    if len(pages_covered) / total_pages < COLONTITUL_PAGE_THRESHOLD:
+        return False
+
+    # Все bbox должны быть в пределах ±20pt по каждой координате
+    ref = matches_of_pattern[0].bbox
+    for m in matches_of_pattern[1:]:
+        if (abs(m.bbox[0] - ref[0]) > COLONTITUL_BBOX_TOLERANCE_PT or
+                abs(m.bbox[1] - ref[1]) > COLONTITUL_BBOX_TOLERANCE_PT or
+                abs(m.bbox[2] - ref[2]) > COLONTITUL_BBOX_TOLERANCE_PT or
+                abs(m.bbox[3] - ref[3]) > COLONTITUL_BBOX_TOLERANCE_PT):
+            return False
+    return True
+
+
+def _filter_by_dominant_patterns(
+    matches: list[SignMatch],
+    total_pages: int = 0,
+    min_pages: int = 2,
+) -> list[SignMatch]:
     """Базовая директива: подписант один → паттерн места подписи единообразен по всему договору.
 
     Доминирующий паттерн = покрытие ≥ 50% от максимального покрытия среди всех паттернов
     (и не менее min_pages). На каждой странице где есть матч доминирующего паттерна,
     матчи остальных паттернов отбрасываются.
+
+    v1.8.1: ПЕРЕД определением доминирования — отсекаем колонтитулы (паттерны
+    на ≥80% страниц с идентичными bbox). Иначе шапка документа выигрывала бы
+    у реальных мест подписи в реквизитах.
     """
     if not matches:
         return matches
 
     from collections import defaultdict
+
+    # ── ШАГ 1 (v1.8.1): Детекция и отсечение колонтитулов ────────────────────
+    pattern_matches: dict[str, list] = defaultdict(list)
+    for m in matches:
+        pattern_matches[m.pattern].append(m)
+
+    colontituls: set[str] = set()
+    for pat, ms_list in pattern_matches.items():
+        if _is_colontitul_pattern(ms_list, total_pages):
+            colontituls.add(pat)
+
+    if colontituls:
+        sys.stderr.write(
+            f"[finder] dropped {len(colontituls)} colontitul pattern(s) "
+            f"covering {total_pages} pages: {list(colontituls)[:3]}...\n"
+        )
+        matches = [m for m in matches if m.pattern not in colontituls]
+        if not matches:
+            return matches
+
+    # ── ШАГ 2: Стандартная логика доминирующего паттерна ─────────────────────
     pattern_pages: dict[str, set] = defaultdict(set)
     for m in matches:
         pattern_pages[m.pattern].add(m.page)
@@ -457,7 +524,10 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
     # Фильтр 8: доминирующий паттерн выигрывает.
     # Если один паттерн = footer-шаблон документа (сработал на 2+ страницах),
     # отбрасываем матчи "слабых" паттернов на тех же страницах.
-    raw_matches = _filter_by_dominant_patterns(raw_matches, min_pages=2)
+    # v1.8.1: ПРЕДВАРИТЕЛЬНО отсекаем колонтитулы — см. _filter_by_dominant_patterns
+    raw_matches = _filter_by_dominant_patterns(
+        raw_matches, total_pages=len(doc.pages), min_pages=2,
+    )
 
     return raw_matches
 

@@ -199,49 +199,95 @@ def _build_anchors(ss: dict) -> dict:
     }
 
 
+def _bbox_center(bbox) -> tuple:
+    """(cx, cy) или None если bbox невалидный."""
+    try:
+        if not bbox or len(bbox) < 4:
+            return None
+        return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+    except Exception:
+        return None
+
+
+def _anchor_page_int(anchor) -> int:
+    """page_hint может быть строкой '0','1','first','last','any' — приводим к int.
+    Возвращает -1 если нельзя определить точно (any/first/last без doc).
+    """
+    ph = getattr(anchor, "page_hint", None)
+    if ph is None:
+        return -1
+    s = str(ph)
+    if s.isdigit():
+        return int(s)
+    return -1  # any/first/last — точно не сопоставить
+
+
 @_section
 def _build_matches_to_anchors_mapping(ss: dict) -> dict:
-    """Критичная секция для диагностики regex_match_to_anchor:
-    какой исходный SignMatch стал каким TextAnchor (или потерялся).
+    """Сопоставляет SignMatch → TextAnchor по (page, bbox center).
 
-    Сопоставление по id (SignMatch.id и TextAnchor.id должны совпадать).
+    ВАЖНО: id у match (sig_NNN) и anchor (uuid) разные — `regex_match_to_anchor`
+    в core/finder.py создаёт новый uuid, не наследует match.id. Поэтому матчинг
+    идёт ПО ПОЗИЦИИ, а не по id.
+
+    Якорь считается соответствующим match'у если:
+      - page совпадает (anchor.page_hint == match.page)
+      - bbox центры расходятся не более чем на BBOX_TOLERANCE_PT
     """
+    BBOX_TOLERANCE_PT = 3.0  # 3pt ≈ 1мм — близкие места считаем одним
+
     matches = ss.get("auto_matches") or []
     anchors = ss.get("all_anchors") or []
 
-    anchor_by_id = {}
+    # Индексируем якоря по странице
+    from collections import defaultdict
+    anchors_by_page = defaultdict(list)
     for a in anchors:
-        aid = getattr(a, "id", None)
-        if aid:
-            anchor_by_id[aid] = a
+        anchors_by_page[_anchor_page_int(a)].append(a)
 
     mapping = []
     matched_anchor_ids = set()
 
     for m in matches:
-        mid = getattr(m, "id", None)
-        a = anchor_by_id.get(mid)
-        if a is not None:
-            matched_anchor_ids.add(mid)
+        m_page = getattr(m, "page", -1)
+        m_bbox = list(getattr(m, "bbox", []) or [])
+        m_center = _bbox_center(m_bbox)
+
+        found_anchor = None
+        if m_center is not None:
+            for a in anchors_by_page.get(m_page, []):
+                a_center = _bbox_center(getattr(a, "bbox", []))
+                if a_center is None:
+                    continue
+                if (abs(a_center[0] - m_center[0]) <= BBOX_TOLERANCE_PT and
+                        abs(a_center[1] - m_center[1]) <= BBOX_TOLERANCE_PT):
+                    found_anchor = a
+                    break
+
+        if found_anchor is not None:
+            matched_anchor_ids.add(getattr(found_anchor, "id", None))
+
         mapping.append({
-            "match_id": mid,
-            "match_page": getattr(m, "page", None),
+            "match_id": getattr(m, "id", None),
+            "match_page": m_page,
             "match_pattern": getattr(m, "pattern", None),
             "match_context": getattr(m, "context", None),
-            "match_bbox": list(getattr(m, "bbox", []) or []),
-            "anchor_found": a is not None,
-            "anchor_generated_pattern": getattr(a, "generated_pattern", None) if a else None,
-            "anchor_text": getattr(a, "anchor_text", None) if a else None,
-            "anchor_level": getattr(a, "anchor_level", None) if a else None,
-            "anchor_context_before": getattr(a, "context_before", None) if a else None,
-            "anchor_context_after": getattr(a, "context_after", None) if a else None,
+            "match_bbox": m_bbox,
+            "anchor_found": found_anchor is not None,
+            "anchor_id": getattr(found_anchor, "id", None) if found_anchor else None,
+            "anchor_added_by": getattr(found_anchor, "added_by", None) if found_anchor else None,
+            "anchor_generated_pattern": getattr(found_anchor, "generated_pattern", None) if found_anchor else None,
+            "anchor_text": getattr(found_anchor, "anchor_text", None) if found_anchor else None,
+            "anchor_level": getattr(found_anchor, "anchor_level", None) if found_anchor else None,
+            "anchor_context_before": getattr(found_anchor, "context_before", None) if found_anchor else None,
+            "anchor_context_after": getattr(found_anchor, "context_after", None) if found_anchor else None,
             "pattern_changed": (
-                getattr(m, "pattern", None) != getattr(a, "generated_pattern", None)
-                if a else None
+                getattr(m, "pattern", None) != getattr(found_anchor, "generated_pattern", None)
+                if found_anchor else None
             ),
         })
 
-    # Якоря которые есть, но не соответствуют ни одному match (manual_click)
+    # Якоря не сопоставленные ни с одним match (ручная доразметка, шаблон, etc.)
     orphan_anchors = []
     for a in anchors:
         aid = getattr(a, "id", None)
@@ -251,6 +297,7 @@ def _build_matches_to_anchors_mapping(ss: dict) -> dict:
                 "added_by": getattr(a, "added_by", None),
                 "anchor_text": getattr(a, "anchor_text", None),
                 "generated_pattern": getattr(a, "generated_pattern", None),
+                "page_hint": str(getattr(a, "page_hint", "")),
             })
 
     return {
@@ -259,6 +306,8 @@ def _build_matches_to_anchors_mapping(ss: dict) -> dict:
         "matched_pairs_count": len([x for x in mapping if x["anchor_found"]]),
         "lost_matches_count": len([x for x in mapping if not x["anchor_found"]]),
         "orphan_anchors_count": len(orphan_anchors),
+        "mapping_method": "by_position (page + bbox center)",
+        "bbox_tolerance_pt": BBOX_TOLERANCE_PT,
         "mapping": mapping,
         "orphan_anchors": orphan_anchors,
     }
