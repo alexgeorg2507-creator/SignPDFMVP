@@ -91,7 +91,7 @@ def _build_matcher(ss: dict) -> dict:
     candidates = getattr(mr, "all_candidates", []) or []
     best = getattr(mr, "best_match", None)
 
-    return {
+    result = {
         "ran": True,
         "traffic_light": getattr(mr, "traffic_light", None),
         "internal_score": getattr(mr, "internal_score", None),
@@ -100,6 +100,36 @@ def _build_matcher(ss: dict) -> dict:
         "all_candidates": [_safe(c) for c in candidates],
         "explanation": getattr(mr, "explanation", None),
     }
+
+    # v1.8.3: подгружаем полное содержимое best_match шаблона из реестра.
+    # Нужно для диагностики кейса «шаблон зелёный, но не применился» —
+    # видно какие якоря (auto_regex / manual_click) сохранены в шаблоне.
+    if best is not None:
+        best_tid = getattr(best, "template_id", None)
+        if best_tid:
+            try:
+                from core.template_storage import load_template
+                full_tpl = load_template(best_tid)
+                if full_tpl is not None:
+                    tpl_dict = _safe(full_tpl) or {}
+                    # Краткая статистика по якорям шаблона
+                    raw_anchors = tpl_dict.get("anchors", []) if isinstance(tpl_dict, dict) else []
+                    by_source = {"auto_regex": 0, "manual_click": 0, "other": 0}
+                    for a in raw_anchors:
+                        src = (a.get("added_by") if isinstance(a, dict) else None) or "other"
+                        by_source[src] = by_source.get(src, 0) + 1
+                    result["best_match_template_full"] = tpl_dict
+                    result["best_match_template_anchors_summary"] = {
+                        "total": len(raw_anchors),
+                        "by_source": by_source,
+                    }
+                else:
+                    result["best_match_template_full"] = None
+                    result["best_match_template_load_error"] = "load_template returned None"
+            except Exception as e:
+                result["best_match_template_load_error"] = f"{type(e).__name__}: {e}"
+
+    return result
 
 
 @_section

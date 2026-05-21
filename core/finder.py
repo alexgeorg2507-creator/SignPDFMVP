@@ -7,16 +7,16 @@ v1.1:
 
 v1.3:
   - умный bbox для матчей с подчёркиваниями: якорное слово + ближайшая линия
-    (раньше fallback ставил красный бокс только на слово "Подпись", теперь
-    bbox охватывает и слово, и реальную линию подписи)
 
 v1.8.2 (фикс регрессии v1.6→v1.7-1.8):
-  - _filter_by_dominant_patterns отключён (no-op). Раньше выкидывал матчи
-    «недоминирующих» паттернов на страницах с доминирующим. Для RU-договоров
-    с инициалированием это семантически неверно: на каждой странице есть
-    мелкий инициал в футере, а на последней дополнительно полная подпись
-    в реквизитах. Оба места легитимные, доминирующий футер съедал подпись
-    в реквизитах. Дедупликацию обеспечивают Фильтры 6,7 (bbox overlap/row).
+  - _filter_by_dominant_patterns отключён (no-op) — директива
+    «один подписант → один паттерн» неверна для RU-инициалирования.
+
+v1.8.3 (фикс применения шаблонов):
+  - apply_template_anchors: нормализация whitespace при сравнении
+    context_before (раньше "a b c" не находилось в "a\\nb\\nc")
+  - apply_template_anchors: bbox-fallback на любой типе якоря если regex
+    не нашёл совпадений. Безопасно — matcher уже подтвердил идентичность.
 """
 import re
 import sys
@@ -504,7 +504,12 @@ def apply_template_anchors(doc, template) -> list[SignMatch]:
     с учётом context_before/context_after для дезамбигуации.
     Возвращает list[SignMatch] с bbox.
 
-    Готово к v1.8 (template matching). В v1.7 не вызывается автоматически.
+    v1.8.3: bbox-fallback для manual_click якорей. Если для manual-якоря
+    regex не нашёл ни одного матча (типичный случай: anchor_builder создаёт
+    слишком строгий generated_pattern через re.escape() всего блока с
+    подчёркиваниями), используется сохранённый anchor.bbox. Это безопасно
+    когда шаблон применяется по зелёному светофору — fingerprint уже
+    подтвердил что документ идентичен.
     """
     from core.anchor_builder import TextAnchor
 
@@ -522,11 +527,13 @@ def apply_template_anchors(doc, template) -> list[SignMatch]:
                 anchor = raw_anchor
 
             pattern_str = anchor.generated_pattern
-            try:
-                regex = re.compile(pattern_str, re.IGNORECASE | re.UNICODE)
-            except re.error:
-                sys.stderr.write(f"[finder] bad anchor pattern: {pattern_str}\n")
-                continue
+            regex = None
+            if pattern_str:
+                try:
+                    regex = re.compile(pattern_str, re.IGNORECASE | re.UNICODE)
+                except re.error:
+                    sys.stderr.write(f"[finder] bad anchor pattern: {pattern_str}\n")
+                    regex = None
 
             # Определяем страницы для поиска по page_hint
             if anchor.page_hint == "first":
@@ -534,46 +541,84 @@ def apply_template_anchors(doc, template) -> list[SignMatch]:
             elif anchor.page_hint == "last":
                 page_range = [len(doc.pages) - 1]
             elif anchor.page_hint == "any":
-                page_range = range(len(doc.pages))
+                page_range = list(range(len(doc.pages)))
             else:
                 try:
                     page_range = [int(anchor.page_hint)]
-                except ValueError:
-                    page_range = range(len(doc.pages))
+                except (ValueError, TypeError):
+                    page_range = list(range(len(doc.pages)))
 
-            for page_idx in page_range:
-                if page_idx >= len(doc.pages):
-                    continue
-                text = doc.pages[page_idx].text
-                page = pdf_doc[page_idx]
+            # Счётчик матчей для этого конкретного якоря
+            anchor_match_count = 0
 
-                for m in regex.finditer(text):
-                    matched_text = m.group(0)
+            if regex is not None:
+                for page_idx in page_range:
+                    if page_idx >= len(doc.pages):
+                        continue
+                    text = doc.pages[page_idx].text
+                    page = pdf_doc[page_idx]
 
-                    # Дезамбигуация по контексту
-                    if anchor.context_before:
-                        ctx_start = max(0, m.start() - len(anchor.context_before) - 20)
-                        preceding = text[ctx_start:m.start()]
-                        if anchor.context_before.strip() and anchor.context_before.strip().lower() not in preceding.lower():
-                            continue
+                    for m in regex.finditer(text):
+                        matched_text = m.group(0)
 
-                    rects = _find_signature_bbox(page, matched_text)
-                    for rect in rects:
-                        if (rect.y1 - rect.y0) > MAX_BBOX_HEIGHT_PT:
-                            continue
-                        counter += 1
-                        start = max(0, m.start() - 40)
-                        end = min(len(text), m.end() + 40)
-                        ctx = text[start:end].replace("\n", " ").strip()
+                        # Дезамбигуация по контексту с нормализацией whitespace.
+                        # context_before сохраняется через _to_anchor с заменой \n на
+                        # пробелы (см. SignMatch.context), а preceding читается из
+                        # сырого page.text. Без нормализации сравнение всегда False.
+                        if anchor.context_before:
+                            ctx_norm = re.sub(r"\s+", " ", anchor.context_before).strip().lower()
+                            if ctx_norm:
+                                ctx_start = max(0, m.start() - len(anchor.context_before) - 40)
+                                preceding_raw = text[ctx_start:m.start()]
+                                preceding_norm = re.sub(r"\s+", " ", preceding_raw).lower()
+                                if ctx_norm not in preceding_norm:
+                                    continue
 
-                        matches.append(SignMatch(
-                            id=f"tpl_{counter:03d}",
-                            page=page_idx,
-                            bbox=tuple(rect),
-                            context=ctx,
-                            party=getattr(template, "name", "template"),
-                            pattern=pattern_str,
-                        ))
+                        rects = _find_signature_bbox(page, matched_text)
+                        for rect in rects:
+                            if (rect.y1 - rect.y0) > MAX_BBOX_HEIGHT_PT:
+                                continue
+                            counter += 1
+                            start = max(0, m.start() - 40)
+                            end = min(len(text), m.end() + 40)
+                            ctx = text[start:end].replace("\n", " ").strip()
+
+                            matches.append(SignMatch(
+                                id=f"tpl_{counter:03d}",
+                                page=page_idx,
+                                bbox=tuple(rect),
+                                context=ctx,
+                                party=getattr(template, "name", "template"),
+                                pattern=pattern_str,
+                            ))
+                            anchor_match_count += 1
+
+            # v1.8.3: bbox-fallback когда regex не нашёл НИЧЕГО для этого якоря.
+            # Срабатывает на любом типе якоря (auto_regex / manual_click).
+            # Безопасно при применении шаблона на идентичном документе:
+            # matcher уже подтвердил совпадение (зелёный/жёлтый light),
+            # значит сохранённый bbox валиден.
+            # Причины почему regex не нашёл:
+            #  - context_before/after не совпали из-за разной нормализации whitespace
+            #  - generated_pattern слишком строгий (re.escape всего блока)
+            #  - PyMuPDF выдал слегка другой text() для тех же координат
+            if anchor_match_count == 0:
+                fallback_page_idx = page_range[0] if page_range else 0
+                if (0 <= fallback_page_idx < len(doc.pages) and
+                        anchor.bbox and len(anchor.bbox) == 4):
+                    counter += 1
+                    matches.append(SignMatch(
+                        id=f"tpl_{counter:03d}",
+                        page=fallback_page_idx,
+                        bbox=tuple(anchor.bbox),
+                        context=(anchor.anchor_text or "")[:80],
+                        party=getattr(template, "name", "template"),
+                        pattern=f"[bbox_fallback] {pattern_str or ''}",
+                    ))
+                    sys.stderr.write(
+                        f"[finder] bbox-fallback anchor source={getattr(anchor, 'added_by', '?')} "
+                        f"page={fallback_page_idx} text={(anchor.anchor_text or '')[:40]!r}\n"
+                    )
     except Exception as e:
         sys.stderr.write(f"[finder] apply_template_anchors: {e}\n")
     finally:
