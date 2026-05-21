@@ -17,6 +17,11 @@ v1.8.3 (фикс применения шаблонов):
     context_before (раньше "a b c" не находилось в "a\\nb\\nc")
   - apply_template_anchors: bbox-fallback на любой типе якоря если regex
     не нашёл совпадений. Безопасно — matcher уже подтвердил идентичность.
+
+v1.8.4 (отсев должностных substring-match'ей):
+  - Фильтр 0.5: alias-токен синонима внутри должностного выражения
+    («Руководитель службы заказчика») → дроп. Различает с легитимными
+    substring-формами («От ЗАКАЗЧИКА») по предшествующим словам.
 """
 import re
 import sys
@@ -244,6 +249,101 @@ def _find_signature_bbox(page, matched_text: str) -> list:
     return []
 
 
+# v1.8.4: пост-фильтр substring-in-role-phrase.
+# Цель — отсекать ложные срабатывания когда alias-токен синонима стороны
+# («Заказчик», «Лебедев», «Клиент») оказался substring-частью должностного
+# выражения типа «Руководитель службы заказчика», а не реальной подписью
+# стороны.
+#
+# Различие с легитимными substring-match'ами (например «От ЗАКАЗЧИКА» —
+# родительный падеж в блоке подписей): мы смотрим что стоит ПЕРЕД alias.
+# Если в 30 символах слева есть должностное слово из стоп-листа —
+# это substring-внутри-роли, дроп. Иначе — keep.
+_DISQUALIFYING_ROLE_WORDS = {
+    "руководитель", "руководителя", "руководителю", "руководителем",
+    "начальник", "начальника", "начальнику", "начальником",
+    "сотрудник", "сотрудника", "сотруднику", "сотрудником",
+    "специалист", "специалиста", "специалисту", "специалистом",
+    "менеджер", "менеджера", "менеджеру", "менеджером",
+    "координатор", "координатора", "координатору",
+    "работник", "работника", "работнику", "работником",
+    "помощник", "помощника", "помощнику",
+    "глава", "главы", "главу", "главой",
+    "зам", "заместитель", "заместителя", "заместителю",
+    "ответственный", "ответственного", "ответственному",
+    "должность", "должности", "должностью",
+    "представители", "представителя", "представителю", "представителем",
+    "служба", "службы", "службу", "службе", "службой",
+}
+
+# Стоп-слова при извлечении токенов из alias (не учитывать как «значимые»).
+_ALIAS_TOKEN_STOP = {
+    "общество", "ограниченной", "ответственностью", "компания", "корпорация",
+    "генеральный", "директор", "лице", "именуем", "именуемая", "именуемое",
+    "именуемый", "далее", "стороны", "стороне", "договор", "договору",
+    "ооо", "оао", "зао", "ао", "ип", "пао", "не", "указано", "указана",
+    "физическое", "юридическое", "лицо",
+}
+
+
+def _alias_tokens(alias: str) -> list[str]:
+    """Извлекает значимые токены из alias для word-context проверки.
+
+    Примеры:
+      'Лебедев Алексей Петрович' → ['Лебедев', 'Алексей', 'Петрович']
+      'ООО «Инлайн технолоджис»' → ['Инлайн', 'технолоджис']
+      'Заказчик' → ['Заказчик']
+      'не указано (физическое лицо)' → []  (всё stop-словa)
+    """
+    if not alias:
+        return []
+    cleaned = re.sub(r"[«»\"'()/\\]", " ", alias)
+    raw = re.findall(r"[\w\u0400-\u04FF]+", cleaned, flags=re.UNICODE)
+    result: list[str] = []
+    seen: set[str] = set()
+    for t in raw:
+        if len(t) < 3:
+            continue
+        tl = t.lower()
+        if tl in _ALIAS_TOKEN_STOP or tl in seen:
+            continue
+        seen.add(tl)
+        result.append(t)
+    return result
+
+
+def _is_alias_in_role_phrase(
+    pre_context: str,
+    matched_text: str,
+    alias_tokens: list[str],
+) -> bool:
+    """True если хотя бы одно вхождение любого alias_token в (pre_context + matched_text)
+    предваряется должностным словом из _DISQUALIFYING_ROLE_WORDS в радиусе 30 символов.
+
+    «Руководитель службы заказчика» → True (для token 'Заказчик')
+    «От ЗАКАЗЧИКА» → False
+    """
+    if not alias_tokens:
+        return False
+
+    combined = (pre_context + " " + matched_text).lower()
+
+    for token in alias_tokens:
+        token_lower = token.lower()
+        if len(token_lower) < 3:
+            continue
+        # Находим все вхождения token в combined (без word boundary,
+        # чтобы поймать substring-формы «заказчик»+«а»)
+        for hit in re.finditer(re.escape(token_lower), combined):
+            preceder = combined[max(0, hit.start() - 30):hit.start()]
+            # Последние 3 слова перед вхождением alias
+            words = re.findall(r"[а-яёa-z]+", preceder, flags=re.UNICODE)
+            for w in words[-3:]:
+                if w in _DISQUALIFYING_ROLE_WORDS:
+                    return True
+    return False
+
+
 # ── Поиск ────────────────────────────────────────────────────────────────────
 
 def _has_real_signature_line(text: str) -> bool:
@@ -353,6 +453,21 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
         a.strip() for a in party.get("other_aliases", []) if a and len(a.strip()) >= 3
     ]
 
+    # v1.8.4: токены наших синонимов для substring-in-role фильтра.
+    # Включаем legal_entity + roles + signer — всё, что в Step4 могло
+    # попасть в regex как привязка к стороне.
+    our_aliases_all: list[str] = list(party.get("aliases", []) or [])
+    if party.get("signer"):
+        our_aliases_all.append(party["signer"])
+    our_alias_tokens: list[str] = []
+    _seen_at: set[str] = set()
+    for a in our_aliases_all:
+        for t in _alias_tokens(a):
+            tl = t.lower()
+            if tl not in _seen_at:
+                _seen_at.add(tl)
+                our_alias_tokens.append(t)
+
     pdf_doc = fitz.open(stream=doc.pdf_bytes, filetype="pdf")
 
     try:
@@ -367,6 +482,17 @@ def find_signatures(doc: ParsedDocument, party: dict) -> list[SignMatch]:
             for pattern_str, regex in compiled:
                 for m in regex.finditer(text):
                     matched_text = m.group(0)
+
+                    # Фильтр 0.5 (v1.8.4): substring-in-role-phrase.
+                    # Alias-токен синонима стороны оказался частью должностного
+                    # выражения («Руководитель службы заказчика»,
+                    # «Специалист по работе с клиентами» и т.п.) →
+                    # это не подпись стороны, а подпись подчинённого/должности.
+                    if our_alias_tokens:
+                        pre_start = max(0, m.start() - 40)
+                        pre_ctx = text[pre_start:m.start()]
+                        if _is_alias_in_role_phrase(pre_ctx, matched_text, our_alias_tokens):
+                            continue
 
                     # Фильтр 1: матч должен содержать реальную линию подписи
                     if not _has_real_signature_line(matched_text):
