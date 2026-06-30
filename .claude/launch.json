@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Streamlit App",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "app.py", "--server.port=8501", "--server.headless=true"],
+      "port": 8501
+    },
+    {
+      "name": "SignFinder Cabinet",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "5500", "--directory", "C:/work/SignfinderLand"],
+      "port": 5500
+    }
+  ]
+}
